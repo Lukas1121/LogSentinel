@@ -1,0 +1,11 @@
+data/
+checkpoints/
+logs/
+results/
+*.h5
+*.pt
+*.bin
+__pycache__/
+*.pyc
+.env
+venv/
