@@ -55,7 +55,7 @@ SAVE_EVERY  = 5             # save checkpoint every N epochs
 EMB_DIM    = 768
 N_LAYERS   = 12
 N_HEADS    = 12
-CTX_LEN    = 1024
+CTX_LEN    = 512
 BATCH_SIZE = 128
 EPOCHS     = 15
 LR         = 3e-4
@@ -382,6 +382,7 @@ def main():
     best_ckpt_path = CKPT_DIR / "model_best.pt"
 
     for epoch in range(1, EPOCHS + 1):
+        scaler = torch.cuda.amp.GradScaler()
         model.train()
         epoch_loss = 0.0
         epoch_start = time.time()
