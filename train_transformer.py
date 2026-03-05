@@ -47,18 +47,18 @@ CKPT_DIR    = Path("checkpoints")
 
 # Model
 VOCAB       = VOCAB_SIZE    # 4096
-EMB_DIM     = 256
-N_LAYERS    = 6
-N_HEADS     = 4
-CTX_LEN     = 512           # max tokens per context window
-
 # Training
-BATCH_SIZE  = 32
-LR          = 2e-4          # slightly lower than standard — BitNet benefit
-EPOCHS      = 50
 GRAD_CLIP   = 1.0
 EVAL_EVERY  = 1             # evaluate on val set every N epochs
 SAVE_EVERY  = 5             # save checkpoint every N epochs
+
+EMB_DIM    = 768
+N_LAYERS   = 12
+N_HEADS    = 12
+CTX_LEN    = 1024
+BATCH_SIZE = 128
+EPOCHS     = 15
+LR         = 3e-4
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -184,7 +184,6 @@ class BitNetTransformer(nn.Module):
 
         # Weight tying: token embedding and lm_head share weights
         # Standard practice — reduces parameters, improves generalisation
-        self.lm_head.weight = self.token_emb.weight
 
         self._init_weights()
 
