@@ -5,3 +5,4 @@ tokenizers
 torch
 wandb
 arithmeticcoding
+scipy

@@ -1,126 +1,149 @@
 #!/bin/bash
 # =============================================================================
-# run_and_exit.sh
+# run_and_exit.sh — Neutron Compression Training Runner
 #
-# Runs training, pushes the model checkpoint to GitHub when done,
-# then terminates the RunPod pod to stop billing.
+# USAGE:
+#   export GITHUB_TOKEN=ghp_xxxxxxxxxxxx
+#   export RUNPOD_API_KEY=xxxxxxxxxxxxxxxx
+#   chmod +x run_and_exit.sh
+#   nohup ./run_and_exit.sh > training.log 2>&1 &
 #
-# SETUP (do this once on the pod before running):
-#   1. Set your GitHub token:      export GITHUB_TOKEN=ghp_xxxxxxxxxxxx
-#   2. Set your RunPod API key:    export RUNPOD_API_KEY=xxxxxxxxxxxxxxxx
-#   3. Make this executable:       chmod +x run_and_exit.sh
-#   4. Run it:                     ./run_and_exit.sh
-#
-# HOW TO GET THESE KEYS:
-#   GITHUB_TOKEN:   GitHub → Settings → Developer Settings → Personal Access Tokens
-#                   Needs "repo" scope (read + write)
-#   RUNPOD_API_KEY: RunPod dashboard → Settings → API Keys
-#   RUNPOD_POD_ID:  Shown in your pod URL e.g. runpod.io/console/pods/abc123
-#                   Or run: curl -s ifconfig.me  (not the pod ID but helps locate it)
-#                   Easiest: copy from the RunPod dashboard pod list
+#   nohup keeps it running if your SSH session disconnects.
+#   Monitor progress from anywhere with:  tail -f training.log
 # =============================================================================
 
-set -e  # Exit immediately if any command fails
+# No "set -e" — we want the script to ALWAYS reach push+terminate,
+# even if training crashes halfway through.
 
-# ── Config ────────────────────────────────────────────────────────────────────
-GITHUB_TOKEN="${GITHUB_TOKEN:?ERROR: Set GITHUB_TOKEN before running}"
-RUNPOD_API_KEY="${RUNPOD_API_KEY:?ERROR: Set RUNPOD_API_KEY before running}"
-RUNPOD_POD_ID="${RUNPOD_POD_ID:?ERROR: Set RUNPOD_POD_ID before running}"
+GITHUB_TOKEN="${GITHUB_TOKEN:?ERROR: export GITHUB_TOKEN=ghp_xxx before running}"
+RUNPOD_API_KEY="${RUNPOD_API_KEY:?ERROR: export RUNPOD_API_KEY=xxx before running}"
+RUNPOD_POD_ID="${RUNPOD_POD_ID:-unknown}"  # RunPod sets this automatically
 
-REPO_DIR="neutron-compression"          # folder cloned from GitHub
-CHECKPOINT="checkpoints/model.pt"       # path inside repo dir
-RESULTS="results/gzip_baseline.json"    # include results too if present
 BRANCH="main"
-COMMIT_MSG="Auto: trained model checkpoint from RunPod pod $RUNPOD_POD_ID"
+TRAIN_EXIT=0  # updated after training
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
 log() { echo "[$(date '+%H:%M:%S')] $*"; }
 
+# =============================================================================
+# TRAP — fires no matter how the script exits:
+#   - normal completion
+#   - training crash
+#   - unhandled error
+#   - SSH disconnect
+# Guarantees we always push + terminate before dying.
+# =============================================================================
+cleanup() {
+    log ""
+    log "========================================="
+    log "  Cleanup triggered — pushing + terminating"
+    log "========================================="
+    push_to_github
+    log ""
+    log "Terminating pod in 10 seconds..."
+    log "(Ctrl+C now if you want to keep the pod alive)"
+    sleep 10
+    terminate_pod
+    log "Done. Billing should stop within 1 minute."
+}
+trap cleanup EXIT
+
+# =============================================================================
+# Push whatever checkpoints exist to GitHub
+# =============================================================================
 push_to_github() {
-    log "Configuring git..."
-    cd "$REPO_DIR"
+    log "--- GitHub push ---"
 
-    git config user.email "runpod-bot@neutron-compression.local"
-    git config user.name "RunPod Training Bot"
+    git config user.email "runpod@bot.local"
+    git config user.name "RunPod Bot"
 
-    # Use token in remote URL so push doesn't require interactive login
+    # Inject token into remote URL so no password prompt
     REMOTE=$(git remote get-url origin)
-    # Insert token: https://github.com/... → https://TOKEN@github.com/...
-    AUTHED_REMOTE="${REMOTE/https:\/\//https:\/\/$GITHUB_TOKEN@}"
-    git remote set-url origin "$AUTHED_REMOTE"
+    git remote set-url origin "${REMOTE/https:\/\//https:\/\/$GITHUB_TOKEN@}"
 
-    log "Staging checkpoint..."
-    git add -f "$CHECKPOINT" 2>/dev/null && log "  Added $CHECKPOINT" || log "  WARNING: $CHECKPOINT not found, skipping"
-    git add -f "$RESULTS"    2>/dev/null && log "  Added $RESULTS"    || log "  WARNING: $RESULTS not found, skipping"
+    # Ensure directories exist so git add doesn't fail
+    mkdir -p checkpoints results
 
-    # Only commit if there's something staged
+    # || true means missing files won't abort the script
+    git add -f checkpoints/model.pt      2>/dev/null || true
+    git add -f checkpoints/model_best.pt 2>/dev/null || true
+    git add -f results/                  2>/dev/null || true
+    git add -f training.log              2>/dev/null || true
+
     if git diff --cached --quiet; then
-        log "WARNING: Nothing to commit — did training produce a checkpoint?"
+        log "  Nothing staged — no checkpoint was saved during training"
+        log "  Check training.log for errors"
     else
-        git commit -m "$COMMIT_MSG"
-        git push origin "$BRANCH"
-        log "SUCCESS: Model pushed to GitHub on branch $BRANCH"
+        git commit -m "Auto: pod=$RUNPOD_POD_ID train_exit=$TRAIN_EXIT"
+        if git push origin "$BRANCH"; then
+            log "  SUCCESS — model pushed to GitHub on branch $BRANCH"
+        else
+            log "  ERROR — git push failed. Check GITHUB_TOKEN has repo write access."
+        fi
     fi
-
-    cd ..
 }
 
+# =============================================================================
+# Terminate the RunPod pod via API
+# =============================================================================
 terminate_pod() {
-    log "Terminating RunPod pod $RUNPOD_POD_ID to stop billing..."
-
+    log "--- Terminating pod $RUNPOD_POD_ID ---"
     RESPONSE=$(curl -s --request POST \
         --url "https://api.runpod.io/graphql?api_key=$RUNPOD_API_KEY" \
         --header "Content-Type: application/json" \
         --data "{\"query\": \"mutation { podTerminate(input: { podId: \\\"$RUNPOD_POD_ID\\\" }) }\"}")
-
-    log "RunPod API response: $RESPONSE"
-
-    if echo "$RESPONSE" | grep -q "error"; then
-        log "WARNING: Pod termination may have failed — check RunPod dashboard manually"
-        log "Pod ID: $RUNPOD_POD_ID"
-    else
-        log "Pod termination requested. Billing should stop within 1 minute."
-    fi
+    log "  RunPod response: $RESPONSE"
 }
 
-# ── Main ──────────────────────────────────────────────────────────────────────
+# =============================================================================
+# MAIN
+# =============================================================================
 log "========================================="
 log "  Neutron Compression — Training Runner"
 log "========================================="
-log "Pod ID:    $RUNPOD_POD_ID"
-log "Repo dir:  $REPO_DIR"
-log "Branch:    $BRANCH"
-echo ""
+log "  Pod ID:  $RUNPOD_POD_ID"
+log "  Branch:  $BRANCH"
+log "  Time:    $(date)"
+log "========================================="
 
-# Step 1 — Generate data
-log "STEP 1/3: Generating synthetic event data..."
-cd "$REPO_DIR"
+# ── Step 1 — Install dependencies ────────────────────────────────────────────
+log ""
+log "STEP 1/4: Installing dependencies..."
+
+# arithmeticcoding ships as a local .py file in the repo — not on PyPI
+sed -i '/arithmeticcoding/d' requirements.txt
+
+pip install -r requirements.txt --quiet
+if [ $? -ne 0 ]; then
+    log "ERROR: pip install failed — attempting to continue anyway..."
+fi
+log "  Dependencies installed"
+
+# ── Step 2 — Generate data ────────────────────────────────────────────────────
+log ""
+log "STEP 2/4: Generating synthetic event data..."
+
 python simulate_events.py
-log "Data generation complete."
-cd ..
+if [ $? -ne 0 ]; then
+    log "ERROR: simulate_events.py failed — cannot train without data"
+    exit 1  # trap fires: push (nothing yet) + terminate
+fi
+log "  Data generation complete"
 
-# Step 2 — Run training
-log "STEP 2/3: Starting training (this will take several hours)..."
-cd "$REPO_DIR"
+# ── Step 3 — Train ────────────────────────────────────────────────────────────
+log ""
+log "STEP 3/4: Training BitNet transformer (this will take several hours)..."
+log "  Checkpoints saved every 5 epochs to checkpoints/"
+
 python train_transformer.py
 TRAIN_EXIT=$?
-cd ..
 
 if [ $TRAIN_EXIT -ne 0 ]; then
-    log "ERROR: Training exited with code $TRAIN_EXIT"
-    log "Attempting to push whatever checkpoints exist before terminating..."
+    log "WARNING: Training exited with code $TRAIN_EXIT"
+    log "  Will still push any checkpoints saved before the crash"
+else
+    log "  Training completed successfully"
 fi
 
-# Step 3 — Push to GitHub regardless of training exit code
-log "STEP 3/3: Pushing results to GitHub..."
-push_to_github
-
-# Final — Terminate pod
-echo ""
-log "All done. Requesting pod termination in 10 seconds..."
-log "(Press Ctrl+C now if you want to keep the pod running)"
-sleep 10
-terminate_pod
-
-# This line will likely never execute — pod will be gone
-log "Termination signal sent."
+# ── Step 4 — trap cleanup EXIT fires automatically here ───────────────────────
+log ""
+log "STEP 4/4: Handing off to cleanup trap (push + terminate)..."
