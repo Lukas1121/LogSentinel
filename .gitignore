@@ -9,3 +9,8 @@ __pycache__/
 *.pyc
 .env
 venv/
+data/
+checkpoints/
+results/
+*.h5
+*.pt
