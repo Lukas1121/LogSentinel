@@ -1,28 +1,38 @@
 # train_transformer.py
-# Step 4: Train a BitNet b1.58 decoder-only transformer on tokenised neutron frames
+# BitNet b1.58 decoder-only transformer for M365 audit log anomaly detection.
 #
-# Architecture (per roadmap):
-#   Vocabulary:     4,096 tokens
-#   Embedding dim:  256
-#   Layers:         6
+# Architecture:
+#   Vocabulary:      256 tokens  (actual ~137, padded to next power of 2)
+#   Embedding dim:   128
+#   Layers:          4
 #   Attention heads: 4
-#   Context length: 512 tokens
-#   Parameters:     ~20-30M
+#   Context length:  128 tokens  (~12 log events per window)
+#   Parameters:      ~1.5M
 #
-# BitLinear uses ternary weights {-1, 0, +1} via absmean quantisation +
-# straight-through estimator for gradients. Weights are float32 during
-# training — ternary efficiency comes at deployment via bitnet.cpp.
+# Training objective: next-token prediction (cross-entropy).
+# Lower validation perplexity = better model of normal behaviour.
 #
-# Objective: next-token prediction (cross-entropy).
-# Lower validation perplexity = better predictor = better compressor.
+# After training, anomaly detection works by:
+#   1. Computing per-window perplexity on the test set.
+#   2. Setting threshold = mean + 2*std on val set perplexity.
+#   3. Windows above threshold are flagged as anomalous.
+#   4. Scoring against ground truth labels -> precision / recall / F1.
 #
-# Outputs: checkpoints/model.pt, checkpoints/training_log.json
+# Inputs:
+#   data/train_tokens.pt    LongTensor (N, 128)
+#   data/val_tokens.pt      LongTensor (N, 128)
+#   data/test_tokens.pt     LongTensor (N, 128)
+#   data/test_labels.pt     BoolTensor (N,)
+#   data/tokeniser.json     vocab metadata
+#
+# Outputs:
+#   checkpoints/model_best.pt
+#   checkpoints/training_log.json
+#   results/anomaly_scores.json
 
 import math
 import json
 import time
-import numpy as np
-import h5py
 from pathlib import Path
 
 import torch
@@ -30,35 +40,29 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 
-from tokenise import (
-    encode_frame,
-    load_tokeniser,
-    make_kdtree,
-    SPECIAL,
-    BIN_ID_OFFSET,
-    VOCAB_SIZE,
-)
-
 # ── Configuration ─────────────────────────────────────────────────────────────
 
-TRAIN_FILE  = Path("data/events_train.h5")
-VAL_FILE    = Path("data/events_val.h5")
-CKPT_DIR    = Path("checkpoints")
+DATA_DIR  = Path("data")
+CKPT_DIR  = Path("checkpoints")
+RES_DIR   = Path("results")
 
 # Model
-VOCAB       = VOCAB_SIZE    # 4096
-# Training
-GRAD_CLIP   = 1.0
-EVAL_EVERY  = 1             # evaluate on val set every N epochs
-SAVE_EVERY  = 5             # save checkpoint every N epochs
+VOCAB      = 256     # next power of 2 above real vocab (~137)
+EMB_DIM    = 128
+N_LAYERS   = 4
+N_HEADS    = 4
+CTX_LEN    = 128
 
-EMB_DIM    = 768
-N_LAYERS   = 12
-N_HEADS    = 12
-CTX_LEN    = 512
-BATCH_SIZE = 128
-EPOCHS     = 15
+# Training
+BATCH_SIZE = 32
+EPOCHS     = 30
 LR         = 3e-4
+GRAD_CLIP  = 1.0
+EVAL_EVERY = 1
+SAVE_EVERY = 5
+
+# Anomaly threshold: flag windows above mean + N_SIGMA * std of val perplexity
+N_SIGMA    = 2.0
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -67,73 +71,49 @@ DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 class BitLinear(nn.Linear):
     """
     Drop-in replacement for nn.Linear with ternary weights {-1, 0, +1}.
-    Forward pass: quantise weights via absmean scheme.
-    Backward pass: straight-through estimator — gradients flow as if float.
-    This is Microsoft BitNet b1.58.
+    Forward: quantise weights via absmean scheme.
+    Backward: straight-through estimator — gradients flow as if float.
+    Microsoft BitNet b1.58.
     """
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        w = self.weight
-
-        # Absmean quantisation: scale so mean(|w|) = 1, then round and clamp
-        scale    = w.abs().mean().clamp(min=1e-8)
+        w         = self.weight
+        scale     = w.abs().mean().clamp(min=1e-8)
         w_ternary = (w / scale).round().clamp(-1, 1)
-
-        # Straight-through estimator: forward uses ternary, backward uses float
-        w_quantised = w + (w_ternary - w).detach()
-
-        return F.linear(x, w_quantised, self.bias)
+        w_quant   = w + (w_ternary - w).detach()
+        return F.linear(x, w_quant, self.bias)
 
 
 # ── Transformer blocks ────────────────────────────────────────────────────────
 
 class CausalSelfAttention(nn.Module):
-    """
-    Multi-head causal self-attention using BitLinear projections.
-    Causal mask ensures token i only attends to tokens 0..i (autoregressive).
-    """
     def __init__(self, emb_dim: int, n_heads: int, ctx_len: int):
         super().__init__()
         assert emb_dim % n_heads == 0
         self.n_heads  = n_heads
         self.head_dim = emb_dim // n_heads
-
-        # Q, K, V projections — all BitLinear
-        self.qkv = BitLinear(emb_dim, 3 * emb_dim, bias=False)
-        self.out  = BitLinear(emb_dim, emb_dim,     bias=False)
-
-        # Causal mask — upper triangle = -inf, registered as buffer (not a param)
+        self.qkv      = BitLinear(emb_dim, 3 * emb_dim, bias=False)
+        self.out      = BitLinear(emb_dim, emb_dim,     bias=False)
         mask = torch.triu(torch.ones(ctx_len, ctx_len), diagonal=1).bool()
         self.register_buffer("causal_mask", mask)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, T, C = x.shape
+        qkv     = self.qkv(x)
+        q, k, v = qkv.split(C, dim=2)
 
-        # Project to Q, K, V and split heads
-        qkv = self.qkv(x)                                    # (B, T, 3C)
-        q, k, v = qkv.split(C, dim=2)                        # each (B, T, C)
-
-        # Reshape to (B, heads, T, head_dim)
         def split_heads(t):
             return t.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
 
         q, k, v = split_heads(q), split_heads(k), split_heads(v)
-
-        # Scaled dot-product attention
-        scale  = math.sqrt(self.head_dim)
-        scores = (q @ k.transpose(-2, -1)) / scale           # (B, heads, T, T)
-
-        # Apply causal mask — mask future positions
-        scores = scores.masked_fill(self.causal_mask[:T, :T], float("-inf"))
-        attn   = F.softmax(scores, dim=-1)
-
-        # Weighted sum of values
-        out = (attn @ v)                                      # (B, heads, T, head_dim)
-        out = out.transpose(1, 2).contiguous().view(B, T, C) # (B, T, C)
+        scale   = math.sqrt(self.head_dim)
+        scores  = (q @ k.transpose(-2, -1)) / scale
+        scores  = scores.masked_fill(self.causal_mask[:T, :T], float("-inf"))
+        attn    = F.softmax(scores, dim=-1)
+        out     = (attn @ v).transpose(1, 2).contiguous().view(B, T, C)
         return self.out(out)
 
 
 class FeedForward(nn.Module):
-    """Standard 4x expansion FFN using BitLinear layers."""
     def __init__(self, emb_dim: int):
         super().__init__()
         self.net = nn.Sequential(
@@ -147,7 +127,6 @@ class FeedForward(nn.Module):
 
 
 class TransformerBlock(nn.Module):
-    """One transformer layer: pre-norm attention + pre-norm FFN."""
     def __init__(self, emb_dim: int, n_heads: int, ctx_len: int):
         super().__init__()
         self.norm1 = nn.LayerNorm(emb_dim)
@@ -156,60 +135,42 @@ class TransformerBlock(nn.Module):
         self.ffn   = FeedForward(emb_dim)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = x + self.attn(self.norm1(x))   # residual connection
-        x = x + self.ffn(self.norm2(x))    # residual connection
+        x = x + self.attn(self.norm1(x))
+        x = x + self.ffn(self.norm2(x))
         return x
 
 
 class BitNetTransformer(nn.Module):
-    """
-    Decoder-only GPT-style transformer with BitLinear layers.
-    Predicts probability distribution over next token at each position.
-    """
     def __init__(self, vocab: int, emb_dim: int, n_layers: int,
                  n_heads: int, ctx_len: int):
         super().__init__()
-        self.ctx_len = ctx_len
-
+        self.ctx_len   = ctx_len
         self.token_emb = nn.Embedding(vocab, emb_dim)
         self.pos_emb   = nn.Embedding(ctx_len, emb_dim)
-
-        self.blocks = nn.Sequential(*[
+        self.blocks    = nn.Sequential(*[
             TransformerBlock(emb_dim, n_heads, ctx_len)
             for _ in range(n_layers)
         ])
-
         self.norm    = nn.LayerNorm(emb_dim)
         self.lm_head = BitLinear(emb_dim, vocab, bias=False)
-
-        # Weight tying: token embedding and lm_head share weights
-        # Standard practice — reduces parameters, improves generalisation
-
         self._init_weights()
 
     def _init_weights(self):
-        """Small initialisations — important for BitNet stability."""
-        for module in self.modules():
-            if isinstance(module, (nn.Linear, BitLinear)):
-                nn.init.normal_(module.weight, mean=0.0, std=0.02)
-                if module.bias is not None:
-                    nn.init.zeros_(module.bias)
-            elif isinstance(module, nn.Embedding):
-                nn.init.normal_(module.weight, mean=0.0, std=0.02)
+        for m in self.modules():
+            if isinstance(m, (nn.Linear, BitLinear)):
+                nn.init.normal_(m.weight, mean=0.0, std=0.02)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+            elif isinstance(m, nn.Embedding):
+                nn.init.normal_(m.weight, mean=0.0, std=0.02)
 
     def forward(self, token_ids: torch.Tensor) -> torch.Tensor:
-        """
-        token_ids: (B, T) integer tensor
-        Returns logits: (B, T, vocab_size)
-        """
-        B, T = token_ids.shape
-        assert T <= self.ctx_len, f"Sequence length {T} exceeds context {self.ctx_len}"
-
-        positions = torch.arange(T, device=token_ids.device)
-        x = self.token_emb(token_ids) + self.pos_emb(positions)  # (B, T, C)
-        x = self.blocks(x)
-        x = self.norm(x)
-        return self.lm_head(x)                                    # (B, T, vocab)
+        B, T    = token_ids.shape
+        pos     = torch.arange(T, device=token_ids.device)
+        x       = self.token_emb(token_ids) + self.pos_emb(pos)
+        x       = self.blocks(x)
+        x       = self.norm(x)
+        return self.lm_head(x)
 
     def count_parameters(self) -> int:
         return sum(p.numel() for p in self.parameters() if p.requires_grad)
@@ -217,94 +178,163 @@ class BitNetTransformer(nn.Module):
 
 # ── Dataset ───────────────────────────────────────────────────────────────────
 
-class NeutronFrameDataset(Dataset):
+class WindowDataset(Dataset):
     """
-    Loads neutron pulse frames, tokenises them, and returns
-    fixed-length context windows for transformer training.
-
-    Each frame is tokenised → token sequence of variable length.
-    Long sequences are split into CTX_LEN chunks.
-    Short sequences are padded to CTX_LEN.
+    Wraps a pre-tokenised window tensor.
+    Returns (input, target) pairs for next-token prediction:
+      input  = window[:-1]
+      target = window[1:]
+    PAD tokens (id=0) are ignored in the loss.
     """
-    def __init__(self, h5_path: Path, kdtree, bin_centres: np.ndarray,
-                 tof_scale: float, ctx_len: int = CTX_LEN):
-        self.ctx_len     = ctx_len
-        self.bin_centres = bin_centres
-        self.tof_scale   = tof_scale
-        self.kdtree      = kdtree
+    def __init__(self, path: Path):
+        self.windows = torch.load(path, weights_only=True)
 
-        # Tokenise all frames and collect context windows
-        print(f"  Tokenising {h5_path.name}...")
-        self.windows = []
-        self._tokenise_all(h5_path)
-        print(f"  {len(self.windows):,} context windows created")
-
-    def _tokenise_all(self, path: Path):
-        with h5py.File(path, "r") as f:
-            n = f.attrs["n_frames"]
-            for i in range(n):
-                frame = f["frames"][str(i)][:]
-                tokens, _ = encode_frame(
-                    frame, self.kdtree, self.bin_centres,
-                    self.tof_scale, mode_token=SPECIAL["MODE_PRIOR"]
-                )
-                # Split into CTX_LEN chunks
-                for start in range(0, len(tokens), self.ctx_len):
-                    chunk = tokens[start:start + self.ctx_len]
-                    # Pad if shorter than ctx_len
-                    if len(chunk) < self.ctx_len:
-                        chunk = chunk + [SPECIAL["PAD"]] * (self.ctx_len - len(chunk))
-                    self.windows.append(torch.tensor(chunk, dtype=torch.long))
-
-                if (i + 1) % 10000 == 0:
-                    print(f"    {i+1}/{n} frames tokenised...")
-
-    def __len__(self):
+    def __len__(self) -> int:
         return len(self.windows)
 
-    def __getitem__(self, idx):
-        tokens = self.windows[idx]                  # (CTX_LEN,)
-        x = tokens[:-1]                             # input:  all but last
-        y = tokens[1:]                              # target: all but first
-        return x, y
+    def __getitem__(self, idx: int):
+        w = self.windows[idx]
+        return w[:-1], w[1:]
 
 
-# ── Training helpers ──────────────────────────────────────────────────────────
+# ── Loss and evaluation ───────────────────────────────────────────────────────
 
-def compute_loss(model: BitNetTransformer, batch: tuple,
-                 device: torch.device) -> torch.Tensor:
+PAD_ID = 0   # matches tokeniser.json special tokens
+
+def compute_loss(model, batch, device):
     x, y = batch
     x, y = x.to(device), y.to(device)
-    logits = model(x)                               # (B, T-1, vocab)
-
-    # Flatten for cross-entropy: ignore PAD tokens in loss
+    logits = model(x)
     B, T, V = logits.shape
-    loss = F.cross_entropy(
+    return F.cross_entropy(
         logits.view(B * T, V),
         y.view(B * T),
-        ignore_index=SPECIAL["PAD"]
+        ignore_index=PAD_ID,
     )
-    return loss
 
 
 @torch.no_grad()
-def evaluate(model: BitNetTransformer, loader: DataLoader,
-             device: torch.device) -> tuple[float, float]:
-    """Returns (mean_loss, perplexity) on the given dataloader."""
+def evaluate(model, loader, device):
+    """Returns (mean_loss, perplexity) on a dataloader."""
     model.eval()
-    total_loss, n_batches = 0.0, 0
+    total, n = 0.0, 0
     for batch in loader:
-        loss = compute_loss(model, batch, device)
-        total_loss += loss.item()
-        n_batches  += 1
-    mean_loss   = total_loss / max(n_batches, 1)
-    perplexity  = math.exp(mean_loss)
+        total += compute_loss(model, batch, device).item()
+        n     += 1
+    mean = total / max(n, 1)
     model.train()
-    return mean_loss, perplexity
+    return mean, math.exp(mean)
 
 
-def save_checkpoint(model: BitNetTransformer, optimiser: torch.optim.Optimizer,
-                    epoch: int, val_loss: float, path: Path):
+@torch.no_grad()
+def window_perplexities(model, windows: torch.Tensor, device,
+                        batch_size: int = 64) -> torch.Tensor:
+    """
+    Compute per-window perplexity for anomaly scoring.
+    Returns a 1-D float tensor of length N_windows.
+    """
+    model.eval()
+    ppls = []
+    for i in range(0, len(windows), batch_size):
+        batch = windows[i : i + batch_size].to(device)
+        x, y  = batch[:, :-1], batch[:, 1:]
+        logits = model(x)
+        B, T, V = logits.shape
+
+        # Per-window loss: mean CE over non-PAD tokens
+        losses = F.cross_entropy(
+            logits.reshape(B * T, V),
+            y.reshape(B * T),
+            ignore_index=PAD_ID,
+            reduction="none",
+        ).reshape(B, T)
+
+        mask = (y != PAD_ID).float()
+        per_window_loss = (losses * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1)
+        ppls.append(per_window_loss.exp().cpu())
+
+    model.train()
+    return torch.cat(ppls)
+
+
+# ── Anomaly evaluation ────────────────────────────────────────────────────────
+
+def evaluate_anomaly_detection(model, device, n_sigma: float = N_SIGMA):
+    """
+    1. Compute val set perplexity distribution -> set threshold.
+    2. Score test windows -> precision, recall, F1.
+    3. Save results/anomaly_scores.json.
+    """
+    print("\nRunning anomaly detection evaluation...")
+    RES_DIR.mkdir(exist_ok=True)
+
+    # Load val windows to calibrate threshold
+    val_windows  = torch.load(DATA_DIR / "val_tokens.pt",  weights_only=True)
+    test_windows = torch.load(DATA_DIR / "test_tokens.pt", weights_only=True)
+    test_labels  = torch.load(DATA_DIR / "test_labels.pt", weights_only=True)
+
+    print("  Computing val perplexity distribution...")
+    val_ppls  = window_perplexities(model, val_windows,  device)
+    print("  Computing test perplexity scores...")
+    test_ppls = window_perplexities(model, test_windows, device)
+
+    # Threshold from val distribution
+    mu, sigma = val_ppls.mean().item(), val_ppls.std().item()
+    threshold = mu + n_sigma * sigma
+    print(f"  Val perplexity:  mean={mu:.2f}  std={sigma:.2f}")
+    print(f"  Threshold ({n_sigma}s): {threshold:.2f}")
+
+    # Binary predictions
+    predicted = test_ppls > threshold
+    labels    = test_labels
+
+    tp = (predicted &  labels).sum().item()
+    fp = (predicted & ~labels).sum().item()
+    fn = (~predicted & labels).sum().item()
+    tn = (~predicted & ~labels).sum().item()
+
+    precision = tp / max(tp + fp, 1)
+    recall    = tp / max(tp + fn, 1)
+    f1        = 2 * precision * recall / max(precision + recall, 1e-8)
+
+    print(f"\n  Test set results ({len(test_windows)} windows):")
+    print(f"    Anomalous windows:  {labels.sum().item()}")
+    print(f"    TP={tp}  FP={fp}  FN={fn}  TN={tn}")
+    print(f"    Precision: {precision:.3f}")
+    print(f"    Recall:    {recall:.3f}")
+    print(f"    F1:        {f1:.3f}")
+
+    # Perplexity guide
+    print(f"\n  Perplexity guide:")
+    print(f"    < 10   -- excellent predictor")
+    print(f"    10-50  -- good predictor")
+    print(f"    50-100 -- moderate")
+    print(f"    > 100  -- poor, unlikely to beat baseline")
+
+    results = {
+        "val_perplexity_mean":  round(mu, 4),
+        "val_perplexity_std":   round(sigma, 4),
+        "threshold":            round(threshold, 4),
+        "n_sigma":              n_sigma,
+        "test_windows":         len(test_windows),
+        "anomalous_windows":    int(labels.sum()),
+        "tp": tp, "fp": fp, "fn": fn, "tn": tn,
+        "precision": round(precision, 4),
+        "recall":    round(recall, 4),
+        "f1":        round(f1, 4),
+        "test_perplexities": test_ppls.tolist(),
+        "test_labels":       test_labels.tolist(),
+    }
+
+    out = RES_DIR / "anomaly_scores.json"
+    out.write_text(json.dumps(results, indent=2))
+    print(f"\n  Results saved -> {out}")
+    return results
+
+
+# ── Checkpoint helpers ────────────────────────────────────────────────────────
+
+def save_checkpoint(model, optimiser, epoch, val_loss, path):
     torch.save({
         "epoch":       epoch,
         "val_loss":    val_loss,
@@ -316,7 +346,7 @@ def save_checkpoint(model: BitNetTransformer, optimiser: torch.optim.Optimizer,
             "n_layers": N_LAYERS,
             "n_heads":  N_HEADS,
             "ctx_len":  CTX_LEN,
-        }
+        },
     }, path)
 
 
@@ -324,98 +354,108 @@ def save_checkpoint(model: BitNetTransformer, optimiser: torch.optim.Optimizer,
 
 def main():
     CKPT_DIR.mkdir(exist_ok=True)
+    RES_DIR.mkdir(exist_ok=True)
 
     print(f"Device: {DEVICE}")
     if DEVICE.type == "cuda":
-        print(f"  GPU: {torch.cuda.get_device_name(0)}")
+        print(f"  GPU:  {torch.cuda.get_device_name(0)}")
         print(f"  VRAM: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
 
-    # ── Load tokeniser ────────────────────────────────────────────────────────
-    print("\nLoading tokeniser...")
-    tok         = load_tokeniser()
-    bin_centres = tok["bin_centres"]
-    tof_scale   = tok["tof_scale"]
-    kdtree      = make_kdtree(bin_centres, tof_scale)
-    print(f"  Bins: {len(bin_centres)}  tof_scale: {tof_scale:.4f}")
+    # ── Load vocab metadata ───────────────────────────────────────────────────
+    tok_path = DATA_DIR / "tokeniser.json"
+    if tok_path.exists():
+        tok_meta = json.loads(tok_path.read_text())
+        real_vocab = len(tok_meta["id2tok"])
+        print(f"\nVocab: {real_vocab} real tokens, padded to {VOCAB} for embedding")
+        if real_vocab > VOCAB:
+            raise ValueError(
+                f"Real vocab ({real_vocab}) exceeds VOCAB constant ({VOCAB}). "
+                f"Increase VOCAB to the next power of 2."
+            )
+    else:
+        print("\nWARNING: tokeniser.json not found. Run tokenise_logs.py first.")
 
     # ── Datasets ──────────────────────────────────────────────────────────────
-    print("\nBuilding training dataset...")
-    train_ds = NeutronFrameDataset(TRAIN_FILE, kdtree, bin_centres, tof_scale)
-    print("\nBuilding validation dataset...")
-    val_ds   = NeutronFrameDataset(VAL_FILE,   kdtree, bin_centres, tof_scale)
+    print("\nLoading datasets...")
+    train_ds = WindowDataset(DATA_DIR / "train_tokens.pt")
+    val_ds   = WindowDataset(DATA_DIR / "val_tokens.pt")
+    print(f"  Train windows: {len(train_ds):,}")
+    print(f"  Val windows:   {len(val_ds):,}")
 
     train_loader = DataLoader(
         train_ds, batch_size=BATCH_SIZE, shuffle=True,
-        num_workers=2, pin_memory=(DEVICE.type == "cuda")
+        num_workers=2, pin_memory=(DEVICE.type == "cuda"),
     )
     val_loader = DataLoader(
         val_ds, batch_size=BATCH_SIZE, shuffle=False,
-        num_workers=2, pin_memory=(DEVICE.type == "cuda")
+        num_workers=2, pin_memory=(DEVICE.type == "cuda"),
     )
 
     # ── Model ─────────────────────────────────────────────────────────────────
     print("\nBuilding BitNet transformer...")
     model = BitNetTransformer(
         vocab=VOCAB, emb_dim=EMB_DIM, n_layers=N_LAYERS,
-        n_heads=N_HEADS, ctx_len=CTX_LEN
+        n_heads=N_HEADS, ctx_len=CTX_LEN,
     ).to(DEVICE)
 
     n_params = model.count_parameters()
-    print(f"  Parameters: {n_params:,}  ({n_params/1e6:.1f}M)")
-    print(f"  Float32 size: {n_params * 4 / 1e6:.1f} MB")
-    print(f"  BitNet size:  {n_params * 2 / 8 / 1e6:.1f} MB  (2 bits/weight)")
+    print(f"  Parameters:   {n_params:,}  ({n_params/1e6:.2f}M)")
+    print(f"  Float32 size: {n_params * 4 / 1e6:.2f} MB")
+    print(f"  BitNet size:  {n_params * 2 / 8 / 1e6:.2f} MB  (2 bits/weight)")
 
     # ── Optimiser + scheduler ─────────────────────────────────────────────────
-    optimiser = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=0.1)
+    optimiser   = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=0.1)
     total_steps = EPOCHS * len(train_loader)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimiser, T_max=total_steps, eta_min=LR / 10
+    scheduler   = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimiser, T_max=total_steps, eta_min=LR / 10,
     )
 
     # ── Training loop ─────────────────────────────────────────────────────────
     print(f"\nTraining for {EPOCHS} epochs...")
-    print(f"  Batch size: {BATCH_SIZE}  Steps/epoch: {len(train_loader):,}")
-    print(f"  Total steps: {total_steps:,}\n")
+    print(f"  Batch size:   {BATCH_SIZE}")
+    print(f"  Steps/epoch:  {len(train_loader):,}")
+    print(f"  Total steps:  {total_steps:,}\n")
 
-    log = []
+    log            = []
     best_val_loss  = float("inf")
-    best_ckpt_path = CKPT_DIR / "model_best.pt"
+    best_ckpt      = CKPT_DIR / "model_best.pt"
+    scaler         = torch.cuda.amp.GradScaler(enabled=(DEVICE.type == "cuda"))
 
     for epoch in range(1, EPOCHS + 1):
-        scaler = torch.cuda.amp.GradScaler()
         model.train()
-        epoch_loss = 0.0
+        epoch_loss  = 0.0
         epoch_start = time.time()
 
         for step, batch in enumerate(train_loader):
             optimiser.zero_grad()
-            loss = compute_loss(model, batch, DEVICE)
-            loss.backward()
+
+            with torch.cuda.amp.autocast(enabled=(DEVICE.type == "cuda")):
+                loss = compute_loss(model, batch, DEVICE)
+
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimiser)
             torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
-            optimiser.step()
+            scaler.step(optimiser)
+            scaler.update()
             scheduler.step()
             epoch_loss += loss.item()
 
-            # Print step-level progress every 200 steps
-            if (step + 1) % 200 == 0:
+            if (step + 1) % 50 == 0:
                 avg = epoch_loss / (step + 1)
                 lr  = scheduler.get_last_lr()[0]
-                print(f"  Epoch {epoch:3d} | step {step+1:5d}/{len(train_loader)} "
+                print(f"  Epoch {epoch:3d} | step {step+1:4d}/{len(train_loader)} "
                       f"| loss {avg:.4f} | lr {lr:.2e}")
 
-        train_loss = epoch_loss / len(train_loader)
-        elapsed    = time.time() - epoch_start
-
-        # Validation
+        train_loss       = epoch_loss / len(train_loader)
         val_loss, val_ppl = evaluate(model, val_loader, DEVICE)
+        elapsed          = time.time() - epoch_start
 
-        print(f"\nEpoch {epoch:3d}/{EPOCHS} — "
-              f"train loss: {train_loss:.4f}  "
-              f"val loss: {val_loss:.4f}  "
-              f"val perplexity: {val_ppl:.2f}  "
+        print(f"\nEpoch {epoch:3d}/{EPOCHS} -- "
+              f"train: {train_loss:.4f}  "
+              f"val: {val_loss:.4f}  "
+              f"ppl: {val_ppl:.2f}  "
               f"({elapsed:.0f}s)\n")
 
-        # Log
         entry = {
             "epoch": epoch, "train_loss": train_loss,
             "val_loss": val_loss, "val_perplexity": val_ppl,
@@ -424,30 +464,33 @@ def main():
         log.append(entry)
         (CKPT_DIR / "training_log.json").write_text(json.dumps(log, indent=2))
 
-        # Save best model
         if val_loss < best_val_loss:
             best_val_loss = val_loss
-            save_checkpoint(model, optimiser, epoch, val_loss, best_ckpt_path)
-            print(f"  ✓ New best model saved (val_loss={val_loss:.4f})")
+            save_checkpoint(model, optimiser, epoch, val_loss, best_ckpt)
+            print(f"  New best model saved  (val_loss={val_loss:.4f})")
 
-        # Periodic checkpoint
         if epoch % SAVE_EVERY == 0:
-            path = CKPT_DIR / f"model_epoch_{epoch:03d}.pt"
-            save_checkpoint(model, optimiser, epoch, val_loss, path)
+            save_checkpoint(model, optimiser, epoch, val_loss,
+                            CKPT_DIR / f"model_epoch_{epoch:03d}.pt")
 
-    # Save final model
+    # ── Save final + run anomaly evaluation ───────────────────────────────────
     save_checkpoint(model, optimiser, EPOCHS, val_loss,
                     CKPT_DIR / "model_final.pt")
 
     print(f"\nTraining complete.")
     print(f"  Best val loss:       {best_val_loss:.4f}")
     print(f"  Best val perplexity: {math.exp(best_val_loss):.2f}")
-    print(f"  Best model saved →   {best_ckpt_path}")
-    print(f"\n  Perplexity guide:")
-    print(f"    < 10   — excellent predictor, expect strong compression gains")
-    print(f"    10–50  — good predictor, expect meaningful gains over gzip")
-    print(f"    50–100 — moderate predictor, marginal gains")
-    print(f"    > 100  — poor predictor, unlikely to beat gzip")
+
+    # Load best model for evaluation (not the final epoch weights)
+    print("\nLoading best checkpoint for anomaly evaluation...")
+    ckpt = torch.load(best_ckpt, map_location=DEVICE, weights_only=True)
+    model.load_state_dict(ckpt["model_state"])
+
+    results = evaluate_anomaly_detection(model, DEVICE)
+
+    print(f"\nDone.")
+    print(f"  F1 score: {results['f1']:.3f}")
+    print(f"  This is your LinkedIn headline number.")
 
 
 if __name__ == "__main__":

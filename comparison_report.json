@@ -1,0 +1,107 @@
+﻿{
+    "synthetic_event_count":  80000,
+    "real_event_count":  129,
+    "workload_real":  {
+                          "SharePoint":  64.3,
+                          "AzureActiveDirectory":  22.5,
+                          "OneDrive":  13.2
+                      },
+    "issues":  [
+                   "1 operation type(s) in real logs not present in synthetic"
+               ],
+    "generated_at":  "2026-03-17T13:17:59.4959454+01:00",
+    "workload_synthetic":  {
+                               "SharePoint":  63,
+                               "AzureActiveDirectory":  24.8,
+                               "OneDrive":  5.2,
+                               "Exchange":  5.1,
+                               "MicrosoftTeams":  1.8
+                           },
+    "field_coverage":  [
+                           {
+                               "Field":  "Id",
+                               "Real":  "100%",
+                               "Synthetic":  "100%",
+                               "Delta":  "0%",
+                               "Status":  "OK"
+                           },
+                           {
+                               "Field":  "CreationTime",
+                               "Real":  "100%",
+                               "Synthetic":  "100%",
+                               "Delta":  "0%",
+                               "Status":  "OK"
+                           },
+                           {
+                               "Field":  "RecordType",
+                               "Real":  "100%",
+                               "Synthetic":  "100%",
+                               "Delta":  "0%",
+                               "Status":  "OK"
+                           },
+                           {
+                               "Field":  "Operation",
+                               "Real":  "100%",
+                               "Synthetic":  "100%",
+                               "Delta":  "0%",
+                               "Status":  "OK"
+                           },
+                           {
+                               "Field":  "UserId",
+                               "Real":  "100%",
+                               "Synthetic":  "100%",
+                               "Delta":  "0%",
+                               "Status":  "OK"
+                           },
+                           {
+                               "Field":  "ClientIP",
+                               "Real":  "77.5%",
+                               "Synthetic":  "78.1%",
+                               "Delta":  "0.599999999999994%",
+                               "Status":  "OK"
+                           },
+                           {
+                               "Field":  "Workload",
+                               "Real":  "100%",
+                               "Synthetic":  "100%",
+                               "Delta":  "0%",
+                               "Status":  "OK"
+                           },
+                           {
+                               "Field":  "ResultStatus",
+                               "Real":  "22.5%",
+                               "Synthetic":  "22.9%",
+                               "Delta":  "0.399999999999999%",
+                               "Status":  "OK"
+                           },
+                           {
+                               "Field":  "AppDisplayName",
+                               "Real":  "0%",
+                               "Synthetic":  "6.1%",
+                               "Delta":  "6.1%",
+                               "Status":  "CLOSE"
+                           },
+                           {
+                               "Field":  "DeviceProperties",
+                               "Real":  "0%",
+                               "Synthetic":  "5.1%",
+                               "Delta":  "5.1%",
+                               "Status":  "CLOSE"
+                           },
+                           {
+                               "Field":  "Location",
+                               "Real":  "0%",
+                               "Synthetic":  "8.2%",
+                               "Delta":  "8.2%",
+                               "Status":  "CLOSE"
+                           },
+                           {
+                               "Field":  "ExtendedProperties",
+                               "Real":  "22.5%",
+                               "Synthetic":  "22.8%",
+                               "Delta":  "0.300000000000001%",
+                               "Status":  "OK"
+                           }
+                       ],
+    "operations_real_only":  "Update StsRefreshTokenValidFrom Timestamp."
+}
