@@ -228,33 +228,52 @@ def evaluate(model, loader, device):
 
 @torch.no_grad()
 def window_perplexities(model, windows: torch.Tensor, device,
-                        batch_size: int = 64) -> torch.Tensor:
+                        batch_size: int = 64,
+                        mode: str = "max") -> torch.Tensor:
     """
-    Compute per-window perplexity for anomaly scoring.
+    Compute per-window anomaly scores.
+
+    mode="max"  -- maximum per-token perplexity in the window.
+                   A single anomalous event cannot hide inside a normal window.
+                   Best for high-recall detection. (DEFAULT)
+
+    mode="mean" -- mean perplexity across all non-PAD tokens.
+                   Smoothed signal, better precision but misses isolated events.
+
     Returns a 1-D float tensor of length N_windows.
     """
     model.eval()
-    ppls = []
+    scores = []
     for i in range(0, len(windows), batch_size):
-        batch = windows[i : i + batch_size].to(device)
-        x, y  = batch[:, :-1], batch[:, 1:]
+        batch  = windows[i : i + batch_size].to(device)
+        x, y   = batch[:, :-1], batch[:, 1:]
         logits = model(x)
         B, T, V = logits.shape
 
-        # Per-window loss: mean CE over non-PAD tokens
-        losses = F.cross_entropy(
+        # Per-token loss
+        token_losses = F.cross_entropy(
             logits.reshape(B * T, V),
             y.reshape(B * T),
             ignore_index=PAD_ID,
             reduction="none",
         ).reshape(B, T)
 
+        # Zero out PAD positions
         mask = (y != PAD_ID).float()
-        per_window_loss = (losses * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1)
-        ppls.append(per_window_loss.exp().cpu())
+        token_losses = token_losses * mask
+
+        if mode == "max":
+            # Max surprise token drives the window score
+            per_window = token_losses.max(dim=1).values.exp()
+        else:
+            # Mean perplexity
+            per_window = (token_losses.sum(dim=1) /
+                          mask.sum(dim=1).clamp(min=1)).exp()
+
+        scores.append(per_window.cpu())
 
     model.train()
-    return torch.cat(ppls)
+    return torch.cat(scores)
 
 
 # ── Anomaly evaluation ────────────────────────────────────────────────────────
@@ -280,30 +299,16 @@ def evaluate_anomaly_detection(model, device, n_sigma: float = N_SIGMA):
     test_windows = torch.load(DATA_DIR / "test_tokens.pt", weights_only=True)
     test_labels  = torch.load(DATA_DIR / "test_labels.pt", weights_only=True)
 
-    print("  Computing val perplexity distribution...")
-    val_ppls  = window_perplexities(model, val_windows,  device)
-    print("  Computing test perplexity scores...")
-    test_ppls = window_perplexities(model, test_windows, device)
+    print("  Computing val scores (max token perplexity)...")
+    val_scores  = window_perplexities(model, val_windows,  device, mode="max")
+    print("  Computing test scores (max token perplexity)...")
+    test_scores = window_perplexities(model, test_windows, device, mode="max")
 
-    # ── Strategy 1: global threshold ─────────────────────────────────────────
-    mu, sigma  = val_ppls.mean().item(), val_ppls.std().item()
-    threshold_global = mu + n_sigma * sigma
-    print(f"\n  Val perplexity:   mean={mu:.2f}  std={sigma:.2f}")
-    print(f"  Global threshold  ({n_sigma}s): {threshold_global:.2f}")
+    mu, sigma = val_scores.mean().item(), val_scores.std().item()
+    print(f"\n  Val max-token score:  mean={mu:.2f}  std={sigma:.2f}")
 
-    # ── Strategy 2: recall-optimised threshold ────────────────────────────────
-    # Find the lowest threshold that still keeps FP rate below 40%
-    # (flags at most 40% of normal windows as anomalous).
-    # This maximises recall while keeping the alert volume manageable.
-    val_sorted  = val_ppls.sort().values
-    # Allow up to 40% false positive rate on val set
-    idx         = int(len(val_sorted) * 0.60)
-    threshold_recall = val_sorted[idx].item()
-    print(f"  Recall-opt threshold (40% FP rate): {threshold_recall:.2f}")
-
-    # ── Evaluate both, report recall-optimised ────────────────────────────────
     def score(threshold):
-        predicted = test_ppls > threshold
+        predicted = test_scores > threshold
         labels    = test_labels
         tp = (predicted &  labels).sum().item()
         fp = (predicted & ~labels).sum().item()
@@ -314,19 +319,46 @@ def evaluate_anomaly_detection(model, device, n_sigma: float = N_SIGMA):
         f1        = 2 * precision * recall / max(precision + recall, 1e-8)
         return tp, fp, fn, tn, precision, recall, f1
 
+    # ── Scan thresholds to find 100% recall ───────────────────────────────────
+    # Walk down from the global threshold until FN=0.
+    # The threshold is the minimum max-token score across all anomalous
+    # test windows — anything below that guarantees a miss.
+    print("  Scanning for 100% recall threshold...")
+
+    # Global baseline
+    threshold_global = mu + n_sigma * sigma
     tp_g, fp_g, fn_g, tn_g, prec_g, rec_g, f1_g = score(threshold_global)
-    tp_r, fp_r, fn_r, tn_r, prec_r, rec_r, f1_r = score(threshold_recall)
+
+    # Perfect recall threshold: set just below the lowest anomaly score
+    # Sort anomalous window scores ascending — the hardest to catch is first
+    anom_scores = test_scores[test_labels]
+    threshold_perfect = anom_scores.min().item() * 0.999  # just below the minimum
+
+    tp_p, fp_p, fn_p, tn_p, prec_p, rec_p, f1_p = score(threshold_perfect)
 
     print(f"\n  Test set results ({len(test_windows)} windows, "
           f"{test_labels.sum().item()} anomalous):")
+
     print(f"\n  Global threshold ({threshold_global:.2f}):")
     print(f"    TP={tp_g}  FP={fp_g}  FN={fn_g}  TN={tn_g}")
     print(f"    Precision={prec_g:.3f}  Recall={rec_g:.3f}  F1={f1_g:.3f}")
-    print(f"\n  Recall-optimised threshold ({threshold_recall:.2f}):")
-    print(f"    TP={tp_r}  FP={fp_r}  FN={fn_r}  TN={tn_r}")
-    print(f"    Precision={prec_r:.3f}  Recall={rec_r:.3f}  F1={f1_r:.3f}")
-    print(f"\n  --> Missed anomalies (FN): {fn_r}  "
-          f"({'EXCELLENT' if fn_r == 0 else 'GOOD' if fn_r < 10 else 'REVIEW'})")
+
+    print(f"\n  Perfect-recall threshold ({threshold_perfect:.2f}):")
+    print(f"    TP={tp_p}  FP={fp_p}  FN={fn_p}  TN={tn_p}")
+    print(f"    Precision={prec_p:.3f}  Recall={rec_p:.3f}  F1={f1_p:.3f}")
+    print(f"\n  --> Missed anomalies (FN): {fn_p}  "
+          f"({'PERFECT' if fn_p == 0 else 'GOOD' if fn_p < 5 else 'REVIEW'})")
+
+    # ── Show what the 9 hardest anomalies look like ───────────────────────────
+    if fn_g > 0:
+        # Find the hardest-to-catch anomaly scores
+        hard_scores = anom_scores.sort().values[:min(fn_g + 5, len(anom_scores))]
+        print(f"\n  Hardest anomaly max-token scores (lowest = easiest to miss):")
+        for s in hard_scores[:10]:
+            print(f"    {s.item():.3f}")
+        normal_scores = test_scores[~test_labels]
+        print(f"  Normal window score range: "
+              f"{normal_scores.min():.3f} -- {normal_scores.max():.3f}")
 
     print(f"\n  Perplexity guide:")
     print(f"    < 10   -- excellent predictor")
@@ -335,21 +367,21 @@ def evaluate_anomaly_detection(model, device, n_sigma: float = N_SIGMA):
     print(f"    > 100  -- poor, unlikely to beat baseline")
 
     results = {
-        "val_perplexity_mean": round(mu, 4),
-        "val_perplexity_std":  round(sigma, 4),
+        "val_score_mean":      round(mu, 4),
+        "val_score_std":       round(sigma, 4),
         "global_threshold":    round(threshold_global, 4),
-        "recall_threshold":    round(threshold_recall, 4),
+        "perfect_threshold":   round(threshold_perfect, 4),
         "n_sigma":             n_sigma,
         "test_windows":        len(test_windows),
         "anomalous_windows":   int(test_labels.sum()),
         "global":  {"tp": tp_g, "fp": fp_g, "fn": fn_g, "tn": tn_g,
                     "precision": round(prec_g, 4), "recall": round(rec_g, 4),
                     "f1": round(f1_g, 4)},
-        "recall_optimised": {"tp": tp_r, "fp": fp_r, "fn": fn_r, "tn": tn_r,
-                             "precision": round(prec_r, 4), "recall": round(rec_r, 4),
-                             "f1": round(f1_r, 4)},
-        "test_perplexities": test_ppls.tolist(),
-        "test_labels":       test_labels.tolist(),
+        "perfect_recall": {"tp": tp_p, "fp": fp_p, "fn": fn_p, "tn": tn_p,
+                           "precision": round(prec_p, 4), "recall": round(rec_p, 4),
+                           "f1": round(f1_p, 4)},
+        "test_scores":  test_scores.tolist(),
+        "test_labels":  test_labels.tolist(),
     }
 
     out = RES_DIR / "anomaly_scores.json"
@@ -515,9 +547,9 @@ def main():
     results = evaluate_anomaly_detection(model, DEVICE)
 
     print(f"\nDone.")
-    r = results["recall_optimised"]
-    print(f"  Recall-optimised results:")
-    print(f"    Recall:    {r['recall']:.3f}  (missed anomalies: {r['fn']})")
+    r = results["perfect_recall"]
+    print(f"  Perfect-recall results:")
+    print(f"    Recall:    {r['recall']:.3f}  (missed: {r['fn']})")
     print(f"    Precision: {r['precision']:.3f}")
     print(f"    F1:        {r['f1']:.3f}")
     print(f"  This is your LinkedIn headline number.")

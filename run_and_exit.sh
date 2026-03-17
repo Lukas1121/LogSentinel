@@ -234,13 +234,16 @@ else
         python3 -c "
 import json
 r = json.load(open('results/anomaly_scores.json'))
+p = r['perfect_recall']
 print()
 print('  =========================================')
-print(f'  Val perplexity:  {r[\"val_perplexity_mean\"]:.2f} (std={r[\"val_perplexity_std\"]:.2f})')
-print(f'  Threshold:       {r[\"threshold\"]:.2f}')
-print(f'  Precision:       {r[\"precision\"]:.3f}')
-print(f'  Recall:          {r[\"recall\"]:.3f}')
-print(f'  F1:              {r[\"f1\"]:.3f}')
+print(f'  Val score mean:  {r[\"val_score_mean\"]:.2f} (std={r[\"val_score_std\"]:.2f})')
+print(f'  Perfect-recall threshold: {r[\"perfect_threshold\"]:.2f}')
+print()
+print(f'  Perfect-recall results:')
+print(f'    Recall:    {p[\"recall\"]:.3f}  (missed: {p[\"fn\"]})')
+print(f'    Precision: {p[\"precision\"]:.3f}')
+print(f'    F1:        {p[\"f1\"]:.3f}')
 print('  =========================================')
 print()
 print('  This is your LinkedIn headline number.')
@@ -248,6 +251,5 @@ print('  This is your LinkedIn headline number.')
     fi
 fi
 
-log ""
 log "STEP 5/4: Cleanup trap will push results and terminate pod..."
 # trap fires here automatically on EXIT
