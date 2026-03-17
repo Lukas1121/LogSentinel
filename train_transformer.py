@@ -56,8 +56,8 @@ CTX_LEN    = 256   # 17 events of per-user history at ~15 tokens/event
 # Training
 BATCH_SIZE = 32
 EPOCHS     = 50
-LR         = 3e-4
-GRAD_CLIP  = 1.0
+LR         = 1e-4  # lowered for larger 2M param model — prevents NaN explosion
+GRAD_CLIP  = 0.5   # tighter clip — BitLinear ternary grads can spike
 EVAL_EVERY = 1
 SAVE_EVERY = 5
 
@@ -477,7 +477,7 @@ def main():
     log            = []
     best_val_loss  = float("inf")
     best_ckpt      = CKPT_DIR / "model_best.pt"
-    scaler         = torch.cuda.amp.GradScaler(enabled=(DEVICE.type == "cuda"))
+    scaler         = torch.cuda.amp.GradScaler(enabled=False)  # disabled — BitLinear + fp16 overflows
 
     for epoch in range(1, EPOCHS + 1):
         model.train()
@@ -487,8 +487,14 @@ def main():
         for step, batch in enumerate(train_loader):
             optimiser.zero_grad()
 
-            with torch.cuda.amp.autocast(enabled=(DEVICE.type == "cuda")):
+            with torch.cuda.amp.autocast(enabled=False):  # disabled — see scaler above
                 loss = compute_loss(model, batch, DEVICE)
+
+            # Skip batch if loss is NaN or Inf (can happen with BitLinear)
+            if not torch.isfinite(loss):
+                optimiser.zero_grad()
+                scheduler.step()
+                continue
 
             scaler.scale(loss).backward()
             scaler.unscale_(optimiser)
