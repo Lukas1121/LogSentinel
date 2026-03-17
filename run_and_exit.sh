@@ -31,6 +31,9 @@ RUNPOD_POD_ID="${RUNPOD_POD_ID:-$(curl -sf http://169.254.169.254/latest/meta-da
 BRANCH="main"
 TRAIN_EXIT=0
 
+# Force Python to flush output immediately — prevents step logs appearing in batches
+export PYTHONUNBUFFERED=1
+
 log() { echo "[$(date '+%H:%M:%S')] $*"; }
 
 # =============================================================================
