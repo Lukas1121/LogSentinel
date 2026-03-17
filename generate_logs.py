@@ -36,9 +36,9 @@ from pathlib import Path
 # ── Config ────────────────────────────────────────────────────────────────────
 
 SEED            = 42
-N_USERS         = 50
-N_TRAIN         = 500_000
-N_VAL           = 20_000
+N_USERS         = 1000
+N_TRAIN         = 2_000_000  # ~2000 events per user across 1000 users
+N_VAL           = 200_000    # 10% of train
 N_ANOMALY_TEST  = 10_000  # mixed: ~99.9% normal, ~0.1% anomalous (realistic)
 ANOMALY_RATIO   = 0.001  # 0.1% — realistic enterprise incident rate
 OUT_DIR         = Path("data")
@@ -269,7 +269,8 @@ class UserProfile:
             f"{random.choice(first_names)} {random.choice(last_names)}"
         )
         slug = self.display_name.lower().replace(" ", ".").replace("ø","o").replace("æ","ae").replace("å","a")
-        self.upn     = f"{slug}@{ORG_DOMAIN}"
+        # Add user_id suffix to guarantee unique UPNs across 1000 users
+        self.upn     = f"{slug}.{user_id}@{ORG_DOMAIN}"
         self.user_id = self.upn
         self.dept    = random.choice(DEPARTMENTS)
         self.is_admin = random.random() < 0.08   # ~8% of users are admins

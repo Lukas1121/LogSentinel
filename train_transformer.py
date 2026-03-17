@@ -47,8 +47,8 @@ CKPT_DIR  = Path("checkpoints")
 RES_DIR   = Path("results")
 
 # Model
-VOCAB      = 512     # next power of 2 above v2 vocab (~200-250 tokens)
-EMB_DIM    = 192    # wider embeddings for richer 15-token events
+VOCAB      = 2048    # next power of 2 above v2 vocab with 1000 users (~1150 tokens)
+EMB_DIM    = 128    # reduced — 192 overfits with only 50 users
 N_LAYERS   = 4
 N_HEADS    = 4
 CTX_LEN    = 256   # 17 events of per-user history at ~15 tokens/event
@@ -86,13 +86,16 @@ class BitLinear(nn.Linear):
 # ── Transformer blocks ────────────────────────────────────────────────────────
 
 class CausalSelfAttention(nn.Module):
-    def __init__(self, emb_dim: int, n_heads: int, ctx_len: int):
+    def __init__(self, emb_dim: int, n_heads: int, ctx_len: int,
+                 dropout: float = 0.1):
         super().__init__()
         assert emb_dim % n_heads == 0
         self.n_heads  = n_heads
         self.head_dim = emb_dim // n_heads
         self.qkv      = BitLinear(emb_dim, 3 * emb_dim, bias=False)
         self.out      = BitLinear(emb_dim, emb_dim,     bias=False)
+        self.attn_drop = nn.Dropout(dropout)
+        self.resid_drop = nn.Dropout(dropout)
         mask = torch.triu(torch.ones(ctx_len, ctx_len), diagonal=1).bool()
         self.register_buffer("causal_mask", mask)
 
@@ -108,18 +111,19 @@ class CausalSelfAttention(nn.Module):
         scale   = math.sqrt(self.head_dim)
         scores  = (q @ k.transpose(-2, -1)) / scale
         scores  = scores.masked_fill(self.causal_mask[:T, :T], float("-inf"))
-        attn    = F.softmax(scores, dim=-1)
+        attn    = self.attn_drop(F.softmax(scores, dim=-1))
         out     = (attn @ v).transpose(1, 2).contiguous().view(B, T, C)
-        return self.out(out)
+        return self.resid_drop(self.out(out))
 
 
 class FeedForward(nn.Module):
-    def __init__(self, emb_dim: int):
+    def __init__(self, emb_dim: int, dropout: float = 0.1):
         super().__init__()
         self.net = nn.Sequential(
             BitLinear(emb_dim, 4 * emb_dim),
             nn.GELU(),
             BitLinear(4 * emb_dim, emb_dim),
+            nn.Dropout(dropout),
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
