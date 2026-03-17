@@ -37,7 +37,7 @@ from pathlib import Path
 
 SEED            = 42
 N_USERS         = 1000
-N_TRAIN         = 2_000_000  # ~2000 events per user across 1000 users
+N_TRAIN         = 1_000_000  # ~1000 events per user across 1000 users -- sufficient for convergence
 N_VAL           = 200_000    # 10% of train
 N_ANOMALY_TEST  = 50_000  # 1000 users x ~50 events, 0.1% anomaly rate = ~50 incidents
 ANOMALY_RATIO   = 0.001  # 0.1% — realistic enterprise incident rate

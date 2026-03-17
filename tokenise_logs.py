@@ -316,48 +316,55 @@ def pack_windows(
     ctx_len: int = CTX_LEN,
     stride: int = STRIDE,
     per_user: bool = True,
-) -> torch.Tensor:
+    return_user_ids: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, list[str]]:
     """
     Encode events and pack into overlapping sliding windows.
 
-    v2: per_user=True (default)
-        Build a separate token stream per user, sorted chronologically.
-        Windows never mix users — the model reads each window as one
-        person's personal timeline. This is what enables "Mike from HR
-        normally logs in 9-17, why is he logging in at 3am?" detection.
-
-    v1: per_user=False
-        All users interleaved in one flat stream. Kept for reference.
+    per_user=True (default): separate stream per user, sorted chronologically.
+    return_user_ids=True: also return a parallel list of user ID hashes,
+        one per window, used for per-user threshold calibration.
 
     Returns LongTensor of shape (N_windows, ctx_len).
+    If return_user_ids=True, returns (tensor, list[str]).
     """
     PAD_ID = vocab.tok2id[PAD_STR]
 
     if per_user:
-        # Group and sort each user's events chronologically
         user_events: dict[str, list[dict]] = defaultdict(list)
         for e in events:
             uid = e.get("UserId", "unknown")
             user_events[uid].append(e)
 
         all_windows = []
+        all_user_ids = []
         for uid in sorted(user_events):
             user_stream = sorted(user_events[uid],
                                  key=lambda e: e.get("CreationTime", ""))
             flat = []
             for event in user_stream:
                 flat.extend(vocab.encode_event(event))
-            all_windows.extend(_sliding_windows(flat, ctx_len, stride, PAD_ID))
+            user_windows = _sliding_windows(flat, ctx_len, stride, PAD_ID)
+            # Hash the uid to match the usr: token format
+            import hashlib
+            uid_hash = hashlib.md5(uid.encode()).hexdigest()[:4]
+            all_windows.extend(user_windows)
+            all_user_ids.extend([uid_hash] * len(user_windows))
 
-        return torch.tensor(all_windows, dtype=torch.long)
+        tensor = torch.tensor(all_windows, dtype=torch.long)
+        if return_user_ids:
+            return tensor, all_user_ids
+        return tensor
     else:
-        # v1 fallback — flat mixed stream
         ordered = sorted(events, key=lambda e: e.get("CreationTime", ""))
         flat = []
         for event in ordered:
             flat.extend(vocab.encode_event(event))
         windows = _sliding_windows(flat, ctx_len, stride, PAD_ID)
-        return torch.tensor(windows, dtype=torch.long)
+        tensor = torch.tensor(windows, dtype=torch.long)
+        if return_user_ids:
+            return tensor, ["unknown"] * len(windows)
+        return tensor
 
 
 def pack_test_windows(
@@ -428,6 +435,7 @@ def pack_test_windows(
     return (
         torch.tensor(all_windows, dtype=torch.long),
         torch.tensor(all_labels,  dtype=torch.bool),
+        all_user_ids,
     )
 
 
@@ -504,12 +512,12 @@ def main():
     train_windows = pack_windows(train_events, vocab, per_user=True)
     print(f"  Windows: {len(train_windows):,}  shape: {tuple(train_windows.shape)}")
 
-    print("Packing validation windows...")
-    val_windows = pack_windows(val_events, vocab, per_user=True)
+    print("Packing validation windows (saving user IDs for per-user thresholds)...")
+    val_windows, val_user_ids = pack_windows(val_events, vocab, per_user=True, return_user_ids=True)
     print(f"  Windows: {len(val_windows):,}  shape: {tuple(val_windows.shape)}")
 
-    print("Packing test windows (with anomaly labels)...")
-    test_windows, test_labels = pack_test_windows(test_events, vocab)
+    print("Packing test windows (with anomaly labels and user IDs)...")
+    test_windows, test_labels, test_user_ids = pack_test_windows(test_events, vocab)
     n_anom_windows = test_labels.sum().item()
     print(f"  Windows: {len(test_windows):,}  Anomalous: {n_anom_windows}")
 
@@ -519,6 +527,9 @@ def main():
     torch.save(val_windows,   OUT_DIR / "val_tokens.pt")
     torch.save(test_windows,  OUT_DIR / "test_tokens.pt")
     torch.save(test_labels,   OUT_DIR / "test_labels.pt")
+    # Save user ID lists for per-user threshold calibration
+    (OUT_DIR / "val_user_ids.json").write_text(json.dumps(val_user_ids))
+    (OUT_DIR / "test_user_ids.json").write_text(json.dumps(test_user_ids))
 
     for name, tensor in [
         ("train_tokens.pt", train_windows),

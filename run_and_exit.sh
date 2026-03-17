@@ -71,6 +71,8 @@ push_to_github() {
     git add -f checkpoints/training_log.json 2>/dev/null || true
     git add -f results/anomaly_scores.json  2>/dev/null || true
     git add -f data/tokeniser.json          2>/dev/null || true
+    git add -f data/val_user_ids.json       2>/dev/null || true
+    git add -f data/test_user_ids.json      2>/dev/null || true
     git add -f training.log                 2>/dev/null || true
 
     # data/*.pt files can be large -- only push if under 90MB each
