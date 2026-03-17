@@ -501,11 +501,11 @@ def main():
 
     # ── Tokenise and pack ─────────────────────────────────────────────────────
     print(f"\nPacking training windows (ctx_len={CTX_LEN})...")
-    train_windows = pack_windows(train_events, vocab, sort_by_user=True)
+    train_windows = pack_windows(train_events, vocab, per_user=True)
     print(f"  Windows: {len(train_windows):,}  shape: {tuple(train_windows.shape)}")
 
     print("Packing validation windows...")
-    val_windows = pack_windows(val_events, vocab, sort_by_user=True)
+    val_windows = pack_windows(val_events, vocab, per_user=True)
     print(f"  Windows: {len(val_windows):,}  shape: {tuple(val_windows.shape)}")
 
     print("Packing test windows (with anomaly labels)...")
