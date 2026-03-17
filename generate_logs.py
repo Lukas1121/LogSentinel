@@ -37,7 +37,7 @@ from pathlib import Path
 
 SEED            = 42
 N_USERS         = 50
-N_TRAIN         = 200_000
+N_TRAIN         = 500_000
 N_VAL           = 20_000
 N_ANOMALY_TEST  = 10_000  # mixed: ~99.9% normal, ~0.1% anomalous (realistic)
 ANOMALY_RATIO   = 0.001  # 0.1% — realistic enterprise incident rate
