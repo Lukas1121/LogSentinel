@@ -395,10 +395,13 @@ def pack_test_windows(
         uid = e.get("UserId", "unknown")
         user_events[uid].append(e)
 
-    all_windows = []
-    all_labels  = []
+    all_windows  = []
+    all_labels   = []
+    all_user_ids = []
 
     for uid in sorted(user_events):
+        import hashlib
+        uid_hash    = hashlib.md5(uid.encode()).hexdigest()[:4]
         user_stream = sorted(user_events[uid],
                              key=lambda e: e.get("CreationTime", ""))
 
@@ -417,6 +420,7 @@ def pack_test_windows(
             anom_chunk = flat_is_anomaly + [False] * (ctx_len - len(flat_is_anomaly))
             all_windows.append(tok_chunk)
             all_labels.append(any(anom_chunk))
+            all_user_ids.append(uid_hash)
             continue
 
         positions = list(range(0, len(flat_tokens) - ctx_len + 1, stride))
@@ -431,6 +435,7 @@ def pack_test_windows(
             anom_chunk = flat_is_anomaly[start : start + ctx_len]
             all_windows.append(tok_chunk)
             all_labels.append(any(anom_chunk))
+            all_user_ids.append(uid_hash)
 
     return (
         torch.tensor(all_windows, dtype=torch.long),
