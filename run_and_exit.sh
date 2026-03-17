@@ -22,7 +22,11 @@
 
 GITHUB_TOKEN="${GITHUB_TOKEN:?ERROR: export GITHUB_TOKEN=ghp_xxx before running}"
 RUNPOD_API_KEY="${RUNPOD_API_KEY:?ERROR: export RUNPOD_API_KEY=xxx before running}"
-RUNPOD_POD_ID="${RUNPOD_POD_ID:-unknown}"
+GITHUB_USER="${GITHUB_USER:-Lukas1121}"
+REPO_NAME="${REPO_NAME:-LogSentinel}"
+
+# RunPod sets RUNPOD_POD_ID in most templates, fall back to unknown
+RUNPOD_POD_ID="${RUNPOD_POD_ID:-$(curl -sf http://169.254.169.254/latest/meta-data/instance-id 2>/dev/null || echo "unknown")}"
 
 BRANCH="main"
 TRAIN_EXIT=0
@@ -115,13 +119,35 @@ log "  Branch:  $BRANCH"
 log "  Time:    $(date)"
 log "========================================="
 
+# ── Step 0 -- Clone repo ─────────────────────────────────────────────────────
+log ""
+log "STEP 0: Cloning repository..."
+
+cd /workspace || cd /root || cd ~
+
+git clone "https://${GITHUB_TOKEN}@github.com/${GITHUB_USER}/${REPO_NAME}.git"
+if [ $? -ne 0 ]; then
+    log "ERROR: git clone failed. Check GITHUB_TOKEN and repo name."
+    exit 1
+fi
+
+cd "$REPO_NAME" || { log "ERROR: could not cd into $REPO_NAME"; exit 1; }
+log "  Cloned into $(pwd)"
+
 # ── Step 1 -- Dependencies ────────────────────────────────────────────────────
 log ""
 log "STEP 1/4: Installing dependencies..."
 
-pip install -r requirements.txt --quiet
-if [ $? -ne 0 ]; then
-    log "ERROR: pip install failed -- attempting to continue..."
+# RunPod A100 images ship with PyTorch pre-installed.
+# Only install if missing to avoid a slow 2GB download.
+if python3 -c "import torch" 2>/dev/null; then
+    log "  PyTorch already installed -- skipping pip install"
+else
+    log "  PyTorch not found -- installing from requirements.txt..."
+    pip install -r requirements.txt --quiet
+    if [ $? -ne 0 ]; then
+        log "ERROR: pip install failed -- attempting to continue..."
+    fi
 fi
 
 # Verify torch is available

@@ -1,2 +1,18 @@
-*.sh text eol=lf
-*.py text eol=lf
+# Shell scripts must have LF line endings on Linux (RunPod)
+*.sh    text eol=lf
+
+# Python files — LF everywhere
+*.py    text eol=lf
+
+# Text/config files
+*.txt   text eol=lf
+*.json  text eol=lf
+*.md    text eol=lf
+
+# PowerShell — CRLF on Windows is fine, but LF works too
+*.ps1   text eol=lf
+
+# Binary files — never touch line endings
+*.pt    binary
+*.h5    binary
+*.hdf5  binary
