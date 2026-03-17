@@ -55,7 +55,7 @@ CTX_LEN    = 256   # 17 events of per-user history at ~15 tokens/event
 
 # Training
 BATCH_SIZE = 32
-EPOCHS     = 50
+EPOCHS     = 30
 LR         = 1e-4  # lowered for larger 2M param model — prevents NaN explosion
 GRAD_CLIP  = 0.5   # tighter clip — BitLinear ternary grads can spike
 EVAL_EVERY = 1
@@ -267,12 +267,16 @@ def window_perplexities(model, windows: torch.Tensor, device,
         token_losses = token_losses * mask
 
         if mode == "max":
-            # Max surprise token drives the window score
-            per_window = token_losses.max(dim=1).values.exp()
+            # Max token loss in window, then log-scale to compress range.
+            # Raw max-perplexity spans billions — log brings it to ~8-30,
+            # making threshold calibration stable and precision meaningful.
+            max_loss    = token_losses.max(dim=1).values
+            per_window  = torch.log1p(max_loss.exp())  # log(1 + e^loss)
         else:
-            # Mean perplexity
-            per_window = (token_losses.sum(dim=1) /
-                          mask.sum(dim=1).clamp(min=1)).exp()
+            # Mean perplexity, also log-scaled for consistency
+            mean_loss  = (token_losses.sum(dim=1) /
+                          mask.sum(dim=1).clamp(min=1))
+            per_window = torch.log1p(mean_loss.exp())
 
         scores.append(per_window.cpu())
 
