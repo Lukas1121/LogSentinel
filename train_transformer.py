@@ -47,11 +47,11 @@ CKPT_DIR  = Path("checkpoints")
 RES_DIR   = Path("results")
 
 # Model
-VOCAB      = 256     # next power of 2 above real vocab (~137)
-EMB_DIM    = 128
+VOCAB      = 512     # next power of 2 above v2 vocab (~200-250 tokens)
+EMB_DIM    = 192    # wider embeddings for richer 15-token events
 N_LAYERS   = 4
 N_HEADS    = 4
-CTX_LEN    = 128
+CTX_LEN    = 256   # 17 events of per-user history at ~15 tokens/event
 
 # Training
 BATCH_SIZE = 32

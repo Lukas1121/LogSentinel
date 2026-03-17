@@ -47,8 +47,8 @@ VAL_FILE   = Path("data/val.jsonl")
 TEST_FILE  = Path("data/anomaly_test.jsonl")
 OUT_DIR    = Path("data")
 
-CTX_LEN    = 128   # tokens per training window
-STRIDE     = 64    # sliding window stride — each event appears in 2 windows
+CTX_LEN    = 256   # tokens per window — fits ~17 events of per-user history
+STRIDE     = 128   # 50% overlap — each event appears in 2 windows
 
 # Special token strings
 PAD_STR = "<PAD>"
@@ -66,7 +66,7 @@ def absent(field: str) -> str:
 # ── Discretisation helpers ────────────────────────────────────────────────────
 
 def ip_prefix(ip: str | None) -> str:
-    """Reduce IP to /16 prefix. 185.20.160.145 -> ip:185.20"""
+    """185.20.160.145 -> ip:185.20  (/16 prefix)"""
     if not ip:
         return absent("ip")
     parts = ip.split(".")
@@ -76,25 +76,39 @@ def ip_prefix(ip: str | None) -> str:
 
 
 def user_hash(uid: str | None) -> str:
-    """Hash user ID to a short 4-char hex token for anonymisation."""
+    """Hash user ID to 4-char hex. Consistent within dataset."""
     if not uid:
         return absent("usr")
     h = hashlib.md5(uid.encode()).hexdigest()[:4]
     return f"usr:{h}"
 
 
-def time_tokens(ts: str | None) -> tuple[str, str]:
+def time_tokens(ts: str | None) -> tuple[str, str, str]:
     """
-    Parse ISO timestamp -> (hr:<hour>, dw:<weekday>)
-    Hour: 0-23.  Day of week: 0=Mon, 6=Sun.
+    Parse ISO timestamp -> (hr:<hour>, dw:<weekday>, tb:<time_bucket>)
+    hr:  0-23 hour of day
+    dw:  0=Mon .. 6=Sun
+    tb:  time bucket — night/earlyam/morning/work/evening
+         This gives the model coarse time-of-day without overfitting to exact hours.
     """
     if not ts:
-        return absent("hr"), absent("dw")
+        return absent("hr"), absent("dw"), absent("tb")
     try:
         dt = datetime.strptime(ts[:19], "%Y-%m-%dT%H:%M:%S")
-        return f"hr:{dt.hour}", f"dw:{dt.weekday()}"
+        h  = dt.hour
+        if h < 6:
+            tb = "tb:night"
+        elif h < 9:
+            tb = "tb:earlyam"
+        elif h < 12:
+            tb = "tb:morning"
+        elif h < 18:
+            tb = "tb:work"
+        else:
+            tb = "tb:evening"
+        return f"hr:{h}", f"dw:{dt.weekday()}", tb
     except ValueError:
-        return absent("hr"), absent("dw")
+        return absent("hr"), absent("dw"), absent("tb")
 
 
 def country_code(event: dict) -> str:
@@ -113,27 +127,96 @@ def result_status(event: dict) -> str:
     return absent("rs")
 
 
+def device_os(event: dict) -> str:
+    """Extract OS family from DeviceProperties."""
+    props = event.get("DeviceProperties")
+    if isinstance(props, list):
+        for p in props:
+            if isinstance(p, dict) and p.get("Name") == "OS":
+                val = p.get("Value", "")
+                # Normalise to OS family — reduces vocab size
+                if "Windows" in val:   return "os:windows"
+                if "macOS" in val:     return "os:macos"
+                if "iOS" in val:       return "os:ios"
+                if "Android" in val:   return "os:android"
+                if "Linux" in val:     return "os:linux"
+                return f"os:other"
+    return absent("os")
+
+
+def device_compliance(event: dict) -> str:
+    """IsCompliant flag — unmanaged device logins are high signal."""
+    props = event.get("DeviceProperties")
+    if isinstance(props, list):
+        for p in props:
+            if isinstance(p, dict) and p.get("Name") == "IsCompliant":
+                return f"comp:{p.get('Value','?').lower()}"
+    return absent("comp")
+
+
+def file_extension(event: dict) -> str:
+    """
+    Extract file extension from SourceFileName.
+    Groups by risk category — .exe/.ps1 are very different from .xlsx.
+    """
+    fname = event.get("SourceFileName")
+    if not fname:
+        return absent("ext")
+    ext = fname.rsplit(".", 1)[-1].lower() if "." in fname else ""
+    # Group into categories rather than raw extension — keeps vocab small
+    if ext in ("exe", "ps1", "bat", "cmd", "msi", "vbs", "js"):
+        return "ext:exec"
+    if ext in ("xlsx", "xls", "csv"):
+        return "ext:spreadsheet"
+    if ext in ("docx", "doc", "pdf", "txt", "md"):
+        return "ext:document"
+    if ext in ("zip", "tar", "gz", "7z", "rar"):
+        return "ext:archive"
+    if ext in ("png", "jpg", "jpeg", "gif", "mp4", "mov"):
+        return "ext:media"
+    if ext:
+        return "ext:other"
+    return absent("ext")
+
+
 # ── Event -> token strings ────────────────────────────────────────────────────
 
 def event_to_tokens(event: dict) -> list[str]:
     """
-    Convert one event dict to a list of namespaced token strings.
-    Always starts with BOS. Order is fixed — the model learns position
-    of each field implicitly.
+    Convert one event to namespaced token strings.
+
+    v2 token set (~15 tokens per event vs 10 in v1):
+      BOS usr op wl ut rs ip cc hr dw tb os comp ext
+
+    New in v2:
+      tb   — time bucket (night/earlyam/morning/work/evening)
+      os   — device OS family
+      comp — IsCompliant flag
+      ext  — file extension category (SharePoint events only)
+
+    Per-user windowing means the model reads these tokens in the context
+    of that specific user's recent history — not a mixed population stream.
     """
-    hr, dw = time_tokens(event.get("CreationTime"))
+    hr, dw, tb = time_tokens(event.get("CreationTime"))
+    workload   = event.get("Workload", "UNKNOWN")
 
     tokens = [
         BOS_STR,
         user_hash(event.get("UserId")),
         f"op:{event.get('Operation', 'UNKNOWN')}",
-        f"wl:{event.get('Workload', 'UNKNOWN')}",
+        f"wl:{workload}",
         f"ut:{event.get('UserType', 0)}",
         result_status(event),
         ip_prefix(event.get("ClientIP")),
         country_code(event),
         hr,
         dw,
+        tb,
+        device_os(event),
+        device_compliance(event),
+        # File extension only meaningful for SharePoint/OneDrive
+        file_extension(event) if workload in ("SharePoint", "OneDrive")
+                              else absent("ext"),
     ]
     return tokens
 
@@ -202,69 +285,96 @@ class Vocab:
 
 # ── Window packer ─────────────────────────────────────────────────────────────
 
+def _sliding_windows(flat: list[int], ctx_len: int, stride: int,
+                      pad_id: int) -> list[list[int]]:
+    """
+    Slice a flat token list into overlapping windows of ctx_len.
+    Short streams (fewer tokens than ctx_len) produce one padded window.
+    """
+    windows = []
+    if len(flat) < ctx_len:
+        # Pad short user streams to ctx_len
+        padded = flat + [pad_id] * (ctx_len - len(flat))
+        windows.append(padded)
+        return windows
+
+    for start in range(0, len(flat) - ctx_len + 1, stride):
+        windows.append(flat[start : start + ctx_len])
+
+    # Capture final events if not already included
+    if len(flat) > ctx_len:
+        last = flat[-ctx_len:]
+        if last != windows[-1]:
+            windows.append(last)
+
+    return windows
+
+
 def pack_windows(
     events: list[dict],
     vocab: Vocab,
     ctx_len: int = CTX_LEN,
     stride: int = STRIDE,
-    sort_by_user: bool = True,
+    per_user: bool = True,
 ) -> torch.Tensor:
     """
-    Encode all events and pack into overlapping sliding windows.
+    Encode events and pack into overlapping sliding windows.
 
-    stride < ctx_len means each event appears in multiple windows.
-    This ensures anomalies near window boundaries are never missed —
-    they will appear fully within at least one window.
+    v2: per_user=True (default)
+        Build a separate token stream per user, sorted chronologically.
+        Windows never mix users — the model reads each window as one
+        person's personal timeline. This is what enables "Mike from HR
+        normally logs in 9-17, why is he logging in at 3am?" detection.
 
-    sort_by_user=True  -> group by user then sort chronologically.
-                          Used for train/val: model sees each user's timeline.
-    sort_by_user=False -> sort globally by time.
-                          Used for test: preserves real temporal order.
+    v1: per_user=False
+        All users interleaved in one flat stream. Kept for reference.
 
     Returns LongTensor of shape (N_windows, ctx_len).
     """
     PAD_ID = vocab.tok2id[PAD_STR]
 
-    if sort_by_user:
+    if per_user:
+        # Group and sort each user's events chronologically
         user_events: dict[str, list[dict]] = defaultdict(list)
         for e in events:
             uid = e.get("UserId", "unknown")
             user_events[uid].append(e)
-        ordered = []
+
+        all_windows = []
         for uid in sorted(user_events):
-            user_events[uid].sort(key=lambda e: e.get("CreationTime", ""))
-            ordered.extend(user_events[uid])
+            user_stream = sorted(user_events[uid],
+                                 key=lambda e: e.get("CreationTime", ""))
+            flat = []
+            for event in user_stream:
+                flat.extend(vocab.encode_event(event))
+            all_windows.extend(_sliding_windows(flat, ctx_len, stride, PAD_ID))
+
+        return torch.tensor(all_windows, dtype=torch.long)
     else:
+        # v1 fallback — flat mixed stream
         ordered = sorted(events, key=lambda e: e.get("CreationTime", ""))
-
-    # Encode all events into a flat token stream
-    flat: list[int] = []
-    for event in ordered:
-        flat.extend(vocab.encode_event(event))
-
-    # Sliding windows with stride — every event appears in ceil(ctx_len/stride) windows
-    windows = []
-    for start in range(0, len(flat) - ctx_len + 1, stride):
-        chunk = flat[start : start + ctx_len]
-        windows.append(chunk)
-
-    # Always include the final window to ensure no trailing events are lost
-    if len(flat) >= ctx_len:
-        last = flat[-ctx_len:]
-        if last != windows[-1] if windows else True:
-            windows.append(last)
-
-    return torch.tensor(windows, dtype=torch.long)
+        flat = []
+        for event in ordered:
+            flat.extend(vocab.encode_event(event))
+        windows = _sliding_windows(flat, ctx_len, stride, PAD_ID)
+        return torch.tensor(windows, dtype=torch.long)
 
 
 def pack_test_windows(
     events: list[dict],
     vocab: Vocab,
     ctx_len: int = CTX_LEN,
+    stride: int = STRIDE,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
-    Pack test events and produce a parallel bool tensor indicating
-    which windows contain at least one anomalous event.
+    Pack test events per-user with anomaly labels.
+
+    Per-user windowing means anomalies are always evaluated in the context
+    of that specific user's own history — not mixed with other users.
+    A window is labelled anomalous if ANY event inside it is anomalous.
+
+    With realistic data (~10 anomalies in 10k events) the anomaly windows
+    will be very sparse — exactly as in production.
 
     Returns (windows, labels):
       windows: LongTensor (N, ctx_len)
@@ -272,35 +382,52 @@ def pack_test_windows(
     """
     PAD_ID = vocab.tok2id[PAD_STR]
 
-    # Sort globally by time (preserve interleaved anomalies)
-    ordered = sorted(events, key=lambda e: e.get("CreationTime", ""))
+    # Group by user, sort each user's events chronologically
+    user_events: dict[str, list[dict]] = defaultdict(list)
+    for e in events:
+        uid = e.get("UserId", "unknown")
+        user_events[uid].append(e)
 
-    flat_tokens: list[int]  = []
-    flat_is_anomaly: list[bool] = []
+    all_windows = []
+    all_labels  = []
 
-    for event in ordered:
-        toks = vocab.encode_event(event)
-        flat_tokens.extend(toks)
-        is_anom = "_anomaly" in event
-        flat_is_anomaly.extend([is_anom] * len(toks))
+    for uid in sorted(user_events):
+        user_stream = sorted(user_events[uid],
+                             key=lambda e: e.get("CreationTime", ""))
 
-    windows = []
-    labels  = []
+        flat_tokens:    list[int]  = []
+        flat_is_anomaly: list[bool] = []
 
-    for start in range(0, len(flat_tokens), ctx_len):
-        tok_chunk  = flat_tokens[start : start + ctx_len]
-        anom_chunk = flat_is_anomaly[start : start + ctx_len]
+        for event in user_stream:
+            toks    = vocab.encode_event(event)
+            is_anom = "_anomaly" in event
+            flat_tokens.extend(toks)
+            flat_is_anomaly.extend([is_anom] * len(toks))
 
-        if len(tok_chunk) < ctx_len:
-            tok_chunk  = tok_chunk  + [PAD_ID] * (ctx_len - len(tok_chunk))
-            anom_chunk = anom_chunk + [False]  * (ctx_len - len(anom_chunk))
+        # Sliding windows over this user's stream
+        if len(flat_tokens) < ctx_len:
+            tok_chunk  = flat_tokens  + [PAD_ID] * (ctx_len - len(flat_tokens))
+            anom_chunk = flat_is_anomaly + [False] * (ctx_len - len(flat_is_anomaly))
+            all_windows.append(tok_chunk)
+            all_labels.append(any(anom_chunk))
+            continue
 
-        windows.append(tok_chunk)
-        labels.append(any(anom_chunk))   # window is anomalous if ANY token was
+        positions = list(range(0, len(flat_tokens) - ctx_len + 1, stride))
+        # Always include the last window
+        if len(flat_tokens) > ctx_len:
+            last_start = len(flat_tokens) - ctx_len
+            if last_start not in positions:
+                positions.append(last_start)
+
+        for start in positions:
+            tok_chunk  = flat_tokens[start : start + ctx_len]
+            anom_chunk = flat_is_anomaly[start : start + ctx_len]
+            all_windows.append(tok_chunk)
+            all_labels.append(any(anom_chunk))
 
     return (
-        torch.tensor(windows, dtype=torch.long),
-        torch.tensor(labels,  dtype=torch.bool),
+        torch.tensor(all_windows, dtype=torch.long),
+        torch.tensor(all_labels,  dtype=torch.bool),
     )
 
 
