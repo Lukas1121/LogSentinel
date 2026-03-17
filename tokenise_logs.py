@@ -47,7 +47,8 @@ VAL_FILE   = Path("data/val.jsonl")
 TEST_FILE  = Path("data/anomaly_test.jsonl")
 OUT_DIR    = Path("data")
 
-CTX_LEN    = 128   # tokens per training window — matches train_transformer.py
+CTX_LEN    = 128   # tokens per training window
+STRIDE     = 64    # sliding window stride — each event appears in 2 windows
 
 # Special token strings
 PAD_STR = "<PAD>"
@@ -205,23 +206,26 @@ def pack_windows(
     events: list[dict],
     vocab: Vocab,
     ctx_len: int = CTX_LEN,
+    stride: int = STRIDE,
     sort_by_user: bool = True,
 ) -> torch.Tensor:
     """
-    Encode all events and pack into fixed-length context windows.
+    Encode all events and pack into overlapping sliding windows.
 
-    sort_by_user=True  -> group by user then sort by time within each group.
+    stride < ctx_len means each event appears in multiple windows.
+    This ensures anomalies near window boundaries are never missed —
+    they will appear fully within at least one window.
+
+    sort_by_user=True  -> group by user then sort chronologically.
                           Used for train/val: model sees each user's timeline.
     sort_by_user=False -> sort globally by time.
-                          Used for test: preserves the real temporal order.
+                          Used for test: preserves real temporal order.
 
     Returns LongTensor of shape (N_windows, ctx_len).
-    PAD token fills any remaining space in the last window.
     """
     PAD_ID = vocab.tok2id[PAD_STR]
 
     if sort_by_user:
-        # Group events by user, sort each group by timestamp
         user_events: dict[str, list[dict]] = defaultdict(list)
         for e in events:
             uid = e.get("UserId", "unknown")
@@ -238,13 +242,17 @@ def pack_windows(
     for event in ordered:
         flat.extend(vocab.encode_event(event))
 
-    # Chunk into ctx_len windows
+    # Sliding windows with stride — every event appears in ceil(ctx_len/stride) windows
     windows = []
-    for start in range(0, len(flat), ctx_len):
+    for start in range(0, len(flat) - ctx_len + 1, stride):
         chunk = flat[start : start + ctx_len]
-        if len(chunk) < ctx_len:
-            chunk = chunk + [PAD_ID] * (ctx_len - len(chunk))
         windows.append(chunk)
+
+    # Always include the final window to ensure no trailing events are lost
+    if len(flat) >= ctx_len:
+        last = flat[-ctx_len:]
+        if last != windows[-1] if windows else True:
+            windows.append(last)
 
     return torch.tensor(windows, dtype=torch.long)
 

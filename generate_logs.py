@@ -37,9 +37,9 @@ from pathlib import Path
 
 SEED            = 42
 N_USERS         = 50
-N_TRAIN         = 80_000
+N_TRAIN         = 200_000
 N_VAL           = 20_000
-N_ANOMALY_TEST  = 2_000   # mixed: ~90% normal, ~10% anomalous
+N_ANOMALY_TEST  = 4_000   # mixed: ~90% normal, ~10% anomalous
 ANOMALY_RATIO   = 0.10
 OUT_DIR         = Path("data")
 
@@ -541,7 +541,7 @@ class AnomalyInjector:
         """
         user   = random.choice(self.users)
         events = []
-        for i in range(random.randint(50, 80)):
+        for i in range(random.randint(8, 12)):
             t     = dt + timedelta(seconds=random.randint(0, 300))
             event = self.sampler.sample(user, t, operation="FileDownloaded")
             self._tag(event, "mass_download")
