@@ -59,8 +59,7 @@ push_to_github() {
     git config user.email "runpod@bot.local"
     git config user.name "RunPod Bot"
 
-    REMOTE=$(git remote get-url origin)
-    git remote set-url origin "${REMOTE/https:\/\//https:\/\/$GITHUB_TOKEN@}"
+    git remote set-url origin "https://${GITHUB_TOKEN}@github.com/${GITHUB_USER}/${REPO_NAME}.git"
 
     mkdir -p checkpoints results data
 
