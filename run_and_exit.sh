@@ -70,6 +70,8 @@ push_to_github() {
     git add -f checkpoints/model_final.pt   2>/dev/null || true
     git add -f checkpoints/training_log.json 2>/dev/null || true
     git add -f results/anomaly_scores.json  2>/dev/null || true
+    git add -f results/stage2_results.json  2>/dev/null || true
+    git add -f results/stage2_alerts.json   2>/dev/null || true
     git add -f data/tokeniser.json          2>/dev/null || true
     git add -f data/val_user_ids.json       2>/dev/null || true
     git add -f data/test_user_ids.json      2>/dev/null || true
@@ -239,13 +241,14 @@ else
         python3 -c "
 import json
 r = json.load(open('results/anomaly_scores.json'))
-p = r['perfect_recall']
+p = r['per_user']
 print()
 print('  =========================================')
-print(f'  Val score mean:  {r[\"val_score_mean\"]:.2f} (std={r[\"val_score_std\"]:.2f})')
-print(f'  Perfect-recall threshold: {r[\"perfect_threshold\"]:.2f}')
+print(f'  Val perplexity:  {r[\"val_score_mean\"]:.2f} (std={r[\"val_score_std\"]:.2f})')
+print(f'  Global threshold: {r[\"global_threshold\"]:.2f}')
+print(f'  Users calibrated: {r[\"n_users_calibrated\"]}')
 print()
-print(f'  Perfect-recall results:')
+print(f'  Per-user threshold results:')
 print(f'    Recall:    {p[\"recall\"]:.3f}  (missed: {p[\"fn\"]})')
 print(f'    Precision: {p[\"precision\"]:.3f}')
 print(f'    F1:        {p[\"f1\"]:.3f}')

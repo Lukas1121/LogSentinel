@@ -62,7 +62,7 @@ EVAL_EVERY = 1
 SAVE_EVERY = 5
 
 # Anomaly threshold: flag windows above mean + N_SIGMA * std of val perplexity
-N_SIGMA    = 1.0  # low threshold = high recall, more false positives (intentional)
+N_SIGMA    = 3.0  # 3 sigma = flags top 0.13% of each user's scores — genuine outliers only
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -581,11 +581,13 @@ def main():
 
     print(f"\nDone.")
     r = results["per_user"]
-    print(f"  Per-user threshold results:")
+    print(f"  Stage 1 (per-user threshold):")
     print(f"    Recall:    {r['recall']:.3f}  (missed: {r['fn']})")
     print(f"    Precision: {r['precision']:.3f}")
     print(f"    F1:        {r['f1']:.3f}")
-    print(f"  This is your LinkedIn headline number.")
+    print(f"\n  Running Stage 2 rule-based filter...")
+    import subprocess, sys
+    subprocess.run([sys.executable, "stage2_filter.py"], check=False)
 
 
 if __name__ == "__main__":
