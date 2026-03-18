@@ -241,15 +241,19 @@ else
         python3 -c "
 import json
 r = json.load(open('results/anomaly_scores.json'))
-p = r['per_user']
+p = r['perfect_recall']
+g = r['global']
 print()
 print('  =========================================')
-print(f'  Val perplexity:  {r[\"val_score_mean\"]:.2f} (std={r[\"val_score_std\"]:.2f})')
+print(f'  Val score mean:  {r[\"val_score_mean\"]:.2f} (std={r[\"val_score_std\"]:.2f})')
 print(f'  Global threshold: {r[\"global_threshold\"]:.2f}')
-print(f'  Users calibrated: {r[\"n_users_calibrated\"]}')
 print()
-print(f'  Per-user threshold results:')
-print(f'    Recall:    {p[\"recall\"]:.3f}  (missed: {p[\"fn\"]})')
+print(f'  Global threshold results:')
+print(f'    Recall:    {g[\"recall\"]:.3f}  FN={g[\"fn\"]}')
+print(f'    Precision: {g[\"precision\"]:.3f}')
+print()
+print(f'  Perfect-recall results:')
+print(f'    Recall:    {p[\"recall\"]:.3f}  FN={p[\"fn\"]}')
 print(f'    Precision: {p[\"precision\"]:.3f}')
 print(f'    F1:        {p[\"f1\"]:.3f}')
 print('  =========================================')

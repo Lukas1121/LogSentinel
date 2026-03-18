@@ -236,27 +236,11 @@ def main():
     print_metrics("After Rule 3:", m3)
     results["after_rule3_storm"] = m3
 
-    # ── Rule 4: Operation frequency ───────────────────────────────────────────
-    print("\nApplying Rule 4 — Operation frequency...")
-    suppressed_r4 = 0
-    for i, flagged in enumerate(active):
-        if not flagged:
-            continue
-        uid     = test_user_ids[i]
-        window  = test_windows[i].tolist()
-        dom_op  = get_dominant_op(window, id2tok)
-
-        if dom_op and uid in user_op_profiles:
-            top_ops = [op for op, _ in
-                       user_op_profiles[uid].most_common(TOP_N_OPS)]
-            if dom_op in top_ops:
-                active[i] = False
-                suppressed_r4 += 1
-
-    m4 = metrics(active, test_labels)
-    print(f"  Suppressed {suppressed_r4} windows (dominant op in user top-{TOP_N_OPS})")
-    print_metrics("After Rule 4:", m4)
-    results["after_rule4_op_freq"] = m4
+    # Rule 4 removed — suppressing windows by dominant operation type
+    # also suppresses genuine attacks (credential theft uses UserLoggedIn
+    # which is every user's most common operation). Rule 4 hurt recall
+    # more than it helped precision.
+    m4 = m3  # final metrics = after rule 3
 
     # ── Final summary ─────────────────────────────────────────────────────────
     print("\n" + "=" * 60)
@@ -271,7 +255,7 @@ def main():
           f"{total_suppressed / max(stage1_metrics['fp'], 1) * 100:.1f}%")
 
     print(f"\n  Final metrics:")
-    final = m4
+    final = m3
     print(f"    Precision: {final['precision']:.3f}  "
           f"(was {stage1_metrics['precision']:.3f})")
     print(f"    Recall:    {final['recall']:.3f}  "

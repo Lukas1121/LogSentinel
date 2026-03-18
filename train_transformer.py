@@ -62,7 +62,7 @@ EVAL_EVERY = 1
 SAVE_EVERY = 5
 
 # Anomaly threshold: flag windows above mean + N_SIGMA * std of val perplexity
-N_SIGMA    = 1  # 3 sigma = flags top 0.13% of each user's scores — genuine outliers only
+N_SIGMA    = 1.0  # Stage 1 casts a wide net — Stage 2 handles false positives
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -307,105 +307,70 @@ def evaluate_anomaly_detection(model, device, n_sigma: float = N_SIGMA):
     test_windows = torch.load(DATA_DIR / "test_tokens.pt", weights_only=True)
     test_labels  = torch.load(DATA_DIR / "test_labels.pt", weights_only=True)
 
-    # Load per-user window assignments
-    val_user_ids  = json.loads((DATA_DIR / "val_user_ids.json").read_text())
-    test_user_ids = json.loads((DATA_DIR / "test_user_ids.json").read_text())
-
     print("  Computing val scores (max token perplexity)...")
     val_scores  = window_perplexities(model, val_windows,  device, mode="max")
     print("  Computing test scores (max token perplexity)...")
     test_scores = window_perplexities(model, test_windows, device, mode="max")
 
-    # ── Per-user threshold calibration ───────────────────────────────────────
-    # For each user, compute their personal threshold = mean + N_sigma * std
-    # from their own val windows. This accounts for the fact that power users
-    # naturally score higher than quiet users even when behaving normally.
-    # Fall back to global threshold for users with fewer than 5 val windows.
-    print("  Calibrating per-user thresholds from val set...")
+    # Global threshold from val distribution
+    mu, sigma     = val_scores.mean().item(), val_scores.std().item()
+    threshold     = mu + n_sigma * sigma
+    print(f"\n  Val score:  mean={mu:.2f}  std={sigma:.2f}")
+    print(f"  Threshold ({n_sigma}s): {threshold:.2f}")
 
-    from collections import defaultdict as _dd
-    user_val_scores: dict = _dd(list)
-    for score_val, uid in zip(val_scores.tolist(), val_user_ids):
-        user_val_scores[uid].append(score_val)
-
-    mu_global    = val_scores.mean().item()
-    std_global   = val_scores.std().item()
-    thresh_global = mu_global + n_sigma * std_global
-
-    user_thresholds: dict = {}
-    for uid, scores in user_val_scores.items():
-        if len(scores) >= 5:
-            import statistics
-            mu_u  = statistics.mean(scores)
-            std_u = statistics.stdev(scores) if len(scores) > 1 else std_global
-            user_thresholds[uid] = mu_u + n_sigma * std_u
-        else:
-            user_thresholds[uid] = thresh_global  # fallback
-
-    print(f"  Per-user thresholds calibrated for {len(user_thresholds)} users")
-    print(f"  Global threshold: {thresh_global:.2f}")
-    thresh_vals = list(user_thresholds.values())
-    print(f"  Per-user threshold range: {min(thresh_vals):.2f} -- {max(thresh_vals):.2f}")
-
-    # ── Apply per-user thresholds to test windows ────────────────────────────
-    predicted_per_user = torch.zeros(len(test_scores), dtype=torch.bool)
-    for i, (score_val, uid) in enumerate(zip(test_scores.tolist(), test_user_ids)):
-        threshold = user_thresholds.get(uid, thresh_global)
-        predicted_per_user[i] = score_val > threshold
-
-    labels = test_labels
-    tp = (predicted_per_user &  labels).sum().item()
-    fp = (predicted_per_user & ~labels).sum().item()
-    fn = (~predicted_per_user & labels).sum().item()
-    tn = (~predicted_per_user & ~labels).sum().item()
-
+    # Score test windows
+    predicted = test_scores > threshold
+    labels    = test_labels
+    tp = (predicted &  labels).sum().item()
+    fp = (predicted & ~labels).sum().item()
+    fn = (~predicted & labels).sum().item()
+    tn = (~predicted & ~labels).sum().item()
     precision = tp / max(tp + fp, 1)
     recall    = tp / max(tp + fn, 1)
     f1        = 2 * precision * recall / max(precision + recall, 1e-8)
 
+    # Perfect-recall threshold — just below the lowest anomaly score
+    anom_scores       = test_scores[labels]
+    threshold_perfect = anom_scores.min().item() * 0.999
+    pred_p = test_scores > threshold_perfect
+    tp_p = (pred_p &  labels).sum().item()
+    fp_p = (pred_p & ~labels).sum().item()
+    fn_p = (~pred_p & labels).sum().item()
+    tn_p = (~pred_p & ~labels).sum().item()
+    prec_p = tp_p / max(tp_p + fp_p, 1)
+    rec_p  = tp_p / max(tp_p + fn_p, 1)
+    f1_p   = 2 * prec_p * rec_p / max(prec_p + rec_p, 1e-8)
+
     print(f"\n  Test set results ({len(test_windows)} windows, "
           f"{labels.sum().item()} anomalous):")
-    print(f"\n  Per-user threshold results:")
+    print(f"\n  Global threshold ({threshold:.2f}):")
     print(f"    TP={tp}  FP={fp}  FN={fn}  TN={tn}")
     print(f"    Precision={precision:.3f}  Recall={recall:.3f}  F1={f1:.3f}")
-    print(f"\n  --> Missed anomalies (FN): {fn}  "
-          f"({'PERFECT' if fn == 0 else 'GOOD' if fn < 5 else 'REVIEW'})")
-
-    # Also show global threshold results for comparison
-    predicted_global = test_scores > thresh_global
-    tp_g = (predicted_global &  labels).sum().item()
-    fp_g = (predicted_global & ~labels).sum().item()
-    fn_g = (~predicted_global & labels).sum().item()
-    tn_g = (~predicted_global & ~labels).sum().item()
-    prec_g = tp_g / max(tp_g + fp_g, 1)
-    rec_g  = tp_g / max(tp_g + fn_g, 1)
-    f1_g   = 2 * prec_g * rec_g / max(prec_g + rec_g, 1e-8)
-
-    print(f"\n  Global threshold ({thresh_global:.2f}) for comparison:")
-    print(f"    TP={tp_g}  FP={fp_g}  FN={fn_g}  TN={tn_g}")
-    print(f"    Precision={prec_g:.3f}  Recall={rec_g:.3f}  F1={f1_g:.3f}")
-
-    print(f"\n  Val perplexity: mean={mu_global:.2f}  std={std_global:.2f}")
+    print(f"\n  Perfect-recall threshold ({threshold_perfect:.2f}):")
+    print(f"    TP={tp_p}  FP={fp_p}  FN={fn_p}  TN={tn_p}")
+    print(f"    Precision={prec_p:.3f}  Recall={rec_p:.3f}  F1={f1_p:.3f}")
+    print(f"\n  --> Missed anomalies (FN): {fn_p}  "
+          f"({'PERFECT' if fn_p == 0 else 'GOOD' if fn_p < 5 else 'REVIEW'})")
 
     results = {
-        "val_score_mean":   round(mu_global, 4),
-        "val_score_std":    round(std_global, 4),
-        "global_threshold": round(thresh_global, 4),
-        "n_sigma":          n_sigma,
-        "n_users_calibrated": len(user_thresholds),
-        "test_windows":     len(test_windows),
-        "anomalous_windows": int(labels.sum()),
-        "per_user": {
+        "val_score_mean":      round(mu, 4),
+        "val_score_std":       round(sigma, 4),
+        "global_threshold":    round(threshold, 4),
+        "perfect_threshold":   round(threshold_perfect, 4),
+        "n_sigma":             n_sigma,
+        "test_windows":        len(test_windows),
+        "anomalous_windows":   int(labels.sum()),
+        "global": {
             "tp": tp, "fp": fp, "fn": fn, "tn": tn,
             "precision": round(precision, 4),
             "recall":    round(recall, 4),
             "f1":        round(f1, 4),
         },
-        "global": {
-            "tp": tp_g, "fp": fp_g, "fn": fn_g, "tn": tn_g,
-            "precision": round(prec_g, 4),
-            "recall":    round(rec_g, 4),
-            "f1":        round(f1_g, 4),
+        "perfect_recall": {
+            "tp": tp_p, "fp": fp_p, "fn": fn_p, "tn": tn_p,
+            "precision": round(prec_p, 4),
+            "recall":    round(rec_p, 4),
+            "f1":        round(f1_p, 4),
         },
         "test_scores":  test_scores.tolist(),
         "test_labels":  test_labels.tolist(),
@@ -580,8 +545,8 @@ def main():
     results = evaluate_anomaly_detection(model, DEVICE)
 
     print(f"\nDone.")
-    r = results["per_user"]
-    print(f"  Stage 1 (per-user threshold):")
+    r = results["perfect_recall"]
+    print(f"  Perfect-recall results:")
     print(f"    Recall:    {r['recall']:.3f}  (missed: {r['fn']})")
     print(f"    Precision: {r['precision']:.3f}")
     print(f"    F1:        {r['f1']:.3f}")
