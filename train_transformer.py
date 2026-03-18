@@ -367,7 +367,11 @@ def main():
         restart_steps = ADDITIONAL_EPOCHS * steps_per_epoch
 
         for pg in optimiser.param_groups:
-            pg["lr"] = restart_lr
+            pg["lr"]         = restart_lr
+            pg["initial_lr"] = restart_lr  # LambdaLR reads initial_lr, not lr.
+            # load_state_dict restores initial_lr=1e-4 from the checkpoint,
+            # so without this patch the scheduler silently uses the original
+            # base LR regardless of what we set pg["lr"] to.
 
         def lr_lambda(step: int) -> float:
             progress = step / max(restart_steps, 1)
