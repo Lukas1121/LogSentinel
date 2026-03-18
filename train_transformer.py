@@ -62,7 +62,7 @@ EVAL_EVERY = 1
 SAVE_EVERY = 5
 
 # Anomaly threshold: flag windows above mean + N_SIGMA * std of val perplexity
-N_SIGMA    = 3.0  # 3 sigma = flags top 0.13% of each user's scores — genuine outliers only
+N_SIGMA    = 1  # 3 sigma = flags top 0.13% of each user's scores — genuine outliers only
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
