@@ -48,10 +48,10 @@ RES_DIR   = Path("results")
 
 # Model
 VOCAB      = 2048    # next power of 2 above v2 vocab with 1000 users (~1150 tokens)
-EMB_DIM    = 128    # reduced — 192 overfits with only 50 users
+EMB_DIM    = 192    # reduced — 192 overfits with only 50 users
 N_LAYERS   = 4
-N_HEADS    = 4
-CTX_LEN    = 256   # 17 events of per-user history at ~15 tokens/event
+N_HEADS    = 6
+CTX_LEN    = 1024   # 17 events of per-user history at ~15 tokens/event
 
 # Training
 BATCH_SIZE = 32
@@ -62,7 +62,7 @@ EVAL_EVERY = 1
 SAVE_EVERY = 5
 
 # Anomaly threshold: flag windows above mean + N_SIGMA * std of val perplexity
-N_SIGMA    = 1.0  # Stage 1 casts a wide net — Stage 2 handles false positives
+N_SIGMA    = 2.0  # Stage 1 casts a wide net — Stage 2 handles false positives
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 

@@ -47,8 +47,8 @@ VAL_FILE   = Path("data/val.jsonl")
 TEST_FILE  = Path("data/anomaly_test.jsonl")
 OUT_DIR    = Path("data")
 
-CTX_LEN    = 256   # tokens per window — fits ~17 events of per-user history
-STRIDE     = 128   # 50% overlap — each event appears in 2 windows
+CTX_LEN    = 1024   # tokens per window — fits ~17 events of per-user history
+STRIDE     = 512   # 50% overlap — each event appears in 2 windows
 
 # Special token strings
 PAD_STR = "<PAD>"
