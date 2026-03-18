@@ -1,51 +1,51 @@
 {
   "stage1": {
-    "tp": 86,
-    "fp": 3234,
-    "fn": 24,
-    "tn": 1652,
-    "precision": 0.0259,
-    "recall": 0.7818,
-    "f1": 0.0501
+    "tp": 11,
+    "fp": 179,
+    "fn": 38,
+    "tn": 775,
+    "precision": 0.0579,
+    "recall": 0.2245,
+    "f1": 0.0921
   },
   "after_rule1_padding": {
-    "tp": 86,
-    "fp": 3234,
-    "fn": 24,
-    "tn": 1652,
-    "precision": 0.0259,
-    "recall": 0.7818,
-    "f1": 0.0501
+    "tp": 11,
+    "fp": 176,
+    "fn": 38,
+    "tn": 778,
+    "precision": 0.0588,
+    "recall": 0.2245,
+    "f1": 0.0932
   },
   "after_rule2_marginal": {
-    "tp": 64,
-    "fp": 1929,
-    "fn": 46,
-    "tn": 2957,
-    "precision": 0.0321,
-    "recall": 0.5818,
-    "f1": 0.0609
+    "tp": 8,
+    "fp": 99,
+    "fn": 41,
+    "tn": 855,
+    "precision": 0.0748,
+    "recall": 0.1633,
+    "f1": 0.1026
   },
   "after_rule3_storm": {
-    "tp": 61,
-    "fp": 1922,
-    "fn": 49,
-    "tn": 2964,
-    "precision": 0.0308,
-    "recall": 0.5545,
-    "f1": 0.0583
+    "tp": 8,
+    "fp": 99,
+    "fn": 41,
+    "tn": 855,
+    "precision": 0.0748,
+    "recall": 0.1633,
+    "f1": 0.1026
   },
   "final": {
-    "tp": 61,
-    "fp": 1922,
-    "fn": 49,
-    "tn": 2964,
-    "precision": 0.0308,
-    "recall": 0.5545,
-    "f1": 0.0583
+    "tp": 8,
+    "fp": 99,
+    "fn": 41,
+    "tn": 855,
+    "precision": 0.0748,
+    "recall": 0.1633,
+    "f1": 0.1026
   },
-  "stage1_flagged": 3320,
-  "stage2_suppressed": 1337,
-  "stage2_remaining": 1983,
-  "fp_reduction_pct": 41.3
+  "stage1_flagged": 190,
+  "stage2_suppressed": 83,
+  "stage2_remaining": 107,
+  "fp_reduction_pct": 46.4
 }
