@@ -1,24 +1,35 @@
 #!/bin/bash
 # =============================================================================
-# run_and_exit.sh -- M365 Log Anomaly Detection Training Runner
+# resume_and_exit.sh -- LogSentinel resume training runner
+#
+# Resumes from an existing checkpoint — skips log generation and tokenisation
+# entirely. The tokeniser vocab and val/test tensors are pulled directly from
+# the repo, train_tokens.pt is regenerated using the existing vocab.
 #
 # USAGE:
 #   export GITHUB_TOKEN=ghp_xxxxxxxxxxxx
 #   export RUNPOD_API_KEY=xxxxxxxxxxxxxxxx
-#   chmod +x run_and_exit.sh
-#   nohup ./run_and_exit.sh > training.log 2>&1 &
+#   chmod +x resume_and_exit.sh
+#   nohup ./resume_and_exit.sh > resume.log 2>&1 &
 #
-#   Monitor from anywhere:  tail -f training.log
+#   Monitor:  tail -f resume.log
 #
 # PIPELINE:
 #   Step 1 -- Install dependencies
-#   Step 2 -- Generate synthetic M365 logs  (generate_logs.py)
-#   Step 3 -- Tokenise logs                 (tokenise_logs.py)
-#   Step 4 -- Train BitNet transformer      (train_transformer.py)
-#   Step 5 -- Evaluate anomaly detection    (detect.py)
-#   Step 6 -- Push results to GitHub + terminate pod
+#   Step 2 -- Regenerate train_tokens.pt using existing tokeniser vocab
+#   Step 3 -- Resume training         (train_transformer.py --resume --restart-lr 4e-5)
+#   Step 4 -- Evaluate                (detect.py --recompute)
+#   Step 5 -- Push results + terminate pod
 #
-# EXPECTED RUNTIME ON A100:  ~12 minutes total
+# WHY A SEPARATE SCRIPT:
+#   run_and_exit.sh regenerates logs + rebuilds the tokeniser from scratch.
+#   On a resume run this is dangerous — if the vocab is rebuilt from new
+#   synthetic data the token IDs can shift, silently corrupting the model
+#   (token 42 meant FileAccessed; now it means something else entirely).
+#   This script uses --use-existing-vocab to freeze the vocab and only
+#   rebuilds train_tokens.pt, leaving val/test tensors from the repo intact.
+#
+# EXPECTED RUNTIME ON A100:  ~8 minutes (40 epochs, no data generation)
 # =============================================================================
 
 GITHUB_TOKEN="${GITHUB_TOKEN:?ERROR: export GITHUB_TOKEN=ghp_xxx before running}"
@@ -31,6 +42,11 @@ RUNPOD_POD_ID="${RUNPOD_POD_ID:-$(curl -sf http://169.254.169.254/latest/meta-da
 BRANCH="main"
 TRAIN_EXIT=0
 DETECT_EXIT=0
+
+# LR for the cosine restart — 40% of original 1e-4.
+# High enough to learn meaningfully on an underfitting model,
+# low enough not to destabilise already-trained weights.
+RESTART_LR="${RESTART_LR:-4e-5}"
 
 export PYTHONUNBUFFERED=1
 
@@ -54,8 +70,6 @@ cleanup() {
 trap cleanup EXIT
 
 # =============================================================================
-# Push everything to GitHub
-# =============================================================================
 push_to_github() {
     log "--- GitHub push ---"
 
@@ -75,9 +89,9 @@ push_to_github() {
     git add -f data/tokeniser.json              2>/dev/null || true
     git add -f data/val_user_ids.json           2>/dev/null || true
     git add -f data/test_user_ids.json          2>/dev/null || true
-    git add -f training.log                     2>/dev/null || true
+    git add -f resume.log                       2>/dev/null || true
 
-    for pt in data/train_tokens.pt data/val_tokens.pt data/test_tokens.pt data/test_labels.pt; do
+    for pt in data/val_tokens.pt data/test_tokens.pt data/test_labels.pt; do
         if [ -f "$pt" ]; then
             size=$(du -m "$pt" | cut -f1)
             if [ "$size" -lt 90 ]; then
@@ -87,11 +101,12 @@ push_to_github() {
             fi
         fi
     done
+    # train_tokens.pt is always too large — never push it
 
     if git diff --cached --quiet; then
-        log "  Nothing staged -- check training.log for errors"
+        log "  Nothing staged -- check resume.log for errors"
     else
-        git commit -m "Auto: pod=$RUNPOD_POD_ID train_exit=$TRAIN_EXIT detect_exit=$DETECT_EXIT [$(date '+%Y-%m-%d %H:%M')]"
+        git commit -m "Resume: pod=$RUNPOD_POD_ID lr=$RESTART_LR train_exit=$TRAIN_EXIT detect_exit=$DETECT_EXIT [$(date '+%Y-%m-%d %H:%M')]"
         if git push origin "$BRANCH"; then
             log "  SUCCESS -- results pushed to GitHub on branch $BRANCH"
         else
@@ -100,9 +115,6 @@ push_to_github() {
     fi
 }
 
-# =============================================================================
-# Terminate the RunPod pod
-# =============================================================================
 terminate_pod() {
     log "--- Terminating pod $RUNPOD_POD_ID ---"
     RESPONSE=$(curl -s --request POST \
@@ -116,15 +128,15 @@ terminate_pod() {
 # MAIN
 # =============================================================================
 log "========================================="
-log "  M365 Log Anomaly Detection"
-log "  BitNet b1.58 Transformer Training"
+log "  LogSentinel — Resume Training"
+log "  restart-lr=$RESTART_LR  additional-epochs=40"
 log "========================================="
 log "  Pod ID:  $RUNPOD_POD_ID"
 log "  Branch:  $BRANCH"
 log "  Time:    $(date)"
 log "========================================="
 
-# ── Step 0 -- Clone repo ─────────────────────────────────────────────────────
+# ── Step 0 -- Clone repo ──────────────────────────────────────────────────────
 log ""
 log "STEP 0: Cloning repository..."
 
@@ -132,126 +144,122 @@ cd /workspace || cd /root || cd ~
 
 git clone "https://${GITHUB_TOKEN}@github.com/${GITHUB_USER}/${REPO_NAME}.git"
 if [ $? -ne 0 ]; then
-    log "ERROR: git clone failed. Check GITHUB_TOKEN and repo name."
+    log "ERROR: git clone failed."
     exit 1
 fi
 
 cd "$REPO_NAME" || { log "ERROR: could not cd into $REPO_NAME"; exit 1; }
 log "  Cloned into $(pwd)"
 
+# Verify checkpoint exists before going any further
+if [ ! -f "checkpoints/model_best.pt" ]; then
+    log "ERROR: checkpoints/model_best.pt not found in repo."
+    log "  Push your checkpoint first, or use run_and_exit.sh for a fresh run."
+    exit 1
+fi
+log "  Checkpoint found: checkpoints/model_best.pt"
+
 # ── Step 1 -- Dependencies ────────────────────────────────────────────────────
 log ""
-log "STEP 1/5: Installing dependencies..."
+log "STEP 1/4: Installing dependencies..."
 
 if python3 -c "import torch" 2>/dev/null; then
-    log "  PyTorch already installed -- skipping pip install"
+    log "  PyTorch already installed -- skipping"
 else
-    log "  PyTorch not found -- installing from requirements.txt..."
     pip install -r requirements.txt --quiet
-    if [ $? -ne 0 ]; then
-        log "ERROR: pip install failed -- attempting to continue..."
-    fi
 fi
 
 python3 -c "import torch; print(f'  PyTorch {torch.__version__}  CUDA={torch.cuda.is_available()}')"
 if [ $? -ne 0 ]; then
-    log "ERROR: PyTorch not importable after install. Cannot continue."
+    log "ERROR: PyTorch not importable."
     exit 1
 fi
 
 if python3 -c "import torch; assert torch.cuda.is_available()"; then
     python3 -c "import torch; print(f'  GPU: {torch.cuda.get_device_name(0)}')"
-    python3 -c "import torch; print(f'  VRAM: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB')"
 else
-    log "WARNING: CUDA not available -- training will run on CPU (much slower)"
+    log "WARNING: CUDA not available -- training will run on CPU"
 fi
 
 log "  Dependencies ready"
 
-# ── Step 2 -- Generate synthetic logs ─────────────────────────────────────────
+# ── Step 2 -- Rebuild train_tokens.pt only ────────────────────────────────────
 log ""
-log "STEP 2/5: Generating synthetic M365 audit logs..."
+log "STEP 2/4: Regenerating train_tokens.pt using existing vocab..."
+log "  (val/test tensors and tokeniser.json already in repo -- not touched)"
 
-python3 generate_logs.py
-if [ $? -ne 0 ]; then
-    log "ERROR: generate_logs.py failed -- cannot continue without data"
-    exit 1
+# Generate fresh train.jsonl (we need new training text, just mapped to old IDs)
+python3 generate_logs.py --train-only
+GEN_EXIT=$?
+
+if [ $GEN_EXIT -ne 0 ]; then
+    log "WARNING: generate_logs.py --train-only failed (exit $GEN_EXIT)"
+    log "  Falling back to full generation..."
+    python3 generate_logs.py
+    if [ $? -ne 0 ]; then
+        log "ERROR: generate_logs.py failed completely"
+        exit 1
+    fi
 fi
 
-for f in data/train.jsonl data/val.jsonl data/anomaly_test.jsonl; do
-    lines=$(wc -l < "$f")
-    log "  $f: $lines events"
-done
-
-log "  Log generation complete"
-
-# ── Step 3 -- Tokenise ────────────────────────────────────────────────────────
-log ""
-log "STEP 3/5: Tokenising logs..."
-
-python3 tokenise_logs.py
+# Tokenise train only, locking vocab to existing tokeniser.json
+# --use-existing-vocab  freezes token IDs — no remapping
+# --train-only          skips val/test tensors (already in repo)
+python3 tokenise_logs.py --use-existing-vocab --train-only
 if [ $? -ne 0 ]; then
     log "ERROR: tokenise_logs.py failed"
     exit 1
 fi
 
-python3 -c "
-import json
-tok = json.load(open('data/tokeniser.json'))
-print(f'  Vocab size: {len(tok[\"id2tok\"])} tokens')
-"
-
-for f in data/train_tokens.pt data/val_tokens.pt data/test_tokens.pt data/test_labels.pt; do
+# Verify everything needed is present
+for f in data/train_tokens.pt data/val_tokens.pt data/test_tokens.pt data/test_labels.pt data/tokeniser.json; do
     if [ -f "$f" ]; then
         size=$(du -h "$f" | cut -f1)
         log "  $f: $size"
     else
-        log "ERROR: $f missing after tokenisation"
+        log "ERROR: $f missing -- cannot resume without it"
         exit 1
     fi
 done
 
-log "  Tokenisation complete"
+log "  Data ready"
 
-# ── Step 4 -- Train ───────────────────────────────────────────────────────────
+# ── Step 3 -- Resume training ─────────────────────────────────────────────────
 log ""
-log "STEP 4/5: Training BitNet transformer..."
-log "  Architecture: 4 layers, 192 dim, 6 heads, ~2M params, CTX_LEN=1024"
+log "STEP 3/4: Resuming training..."
+log "  --resume --restart-lr $RESTART_LR  (+40 epochs)"
 
-# If a checkpoint already exists in the repo, resume from it instead of
-# training from scratch — saves cost when adding epochs to an existing model.
-python3 train_transformer.py
+python3 train_transformer.py --resume --restart-lr "$RESTART_LR"
 TRAIN_EXIT=$?
 
 if [ $TRAIN_EXIT -ne 0 ]; then
     log "WARNING: Training exited with code $TRAIN_EXIT"
-    log "  Pushing any checkpoints saved before the crash"
 else
     log "  Training complete"
 
-    # Print val perplexity from the training log
     if [ -f "checkpoints/training_log.json" ]; then
         python3 -c "
 import json, math
 log = json.load(open('checkpoints/training_log.json'))
 best = min(log, key=lambda e: e['val_loss'])
+last = log[-1]
 print()
 print('  =========================================')
-print(f'  Best epoch:       {best[\"epoch\"]}')
-print(f'  Best val loss:    {best[\"val_loss\"]:.4f}')
-print(f'  Best val ppl:     {best[\"val_perplexity\"]:.2f}')
+print(f'  Best epoch:     {best[\"epoch\"]}')
+print(f'  Best val loss:  {best[\"val_loss\"]:.4f}')
+print(f'  Best val ppl:   {best[\"val_perplexity\"]:.2f}')
+print(f'  Last epoch:     {last[\"epoch\"]}')
+print(f'  Last val ppl:   {last[\"val_perplexity\"]:.2f}')
 print('  =========================================')
 "
     fi
 fi
 
-# ── Step 5 -- Anomaly detection evaluation ────────────────────────────────────
+# ── Step 4 -- Evaluate ────────────────────────────────────────────────────────
 log ""
-log "STEP 5/5: Running anomaly detection evaluation (detect.py)..."
+log "STEP 4/4: Running anomaly detection evaluation..."
 
-# Default: sigma sweep so we can see the full operating curve in the log.
-# To use a fixed sigma, change to: python3 detect.py --sigma 2.0 --stage2
-python3 detect.py --recompute --pr-curve
+python3 detect.py --recompute
 DETECT_EXIT=$?
 
 if [ $DETECT_EXIT -ne 0 ]; then
@@ -259,7 +267,6 @@ if [ $DETECT_EXIT -ne 0 ]; then
 else
     log "  Detection evaluation complete"
 
-    # Print the headline numbers if anomaly_scores.json was written
     if [ -f "results/anomaly_scores.json" ]; then
         python3 -c "
 import json
@@ -283,5 +290,5 @@ print('  Tune sigma with: python3 detect.py --sigma <value>')
 fi
 
 log ""
-log "STEP 6: Cleanup trap will push results and terminate pod..."
-# trap fires here automatically on EXIT
+log "Cleanup trap will push results and terminate pod..."
+# trap fires here on EXIT

@@ -26,6 +26,7 @@
 #   checkpoints/model_epoch_NNN.pt   -- periodic checkpoints
 #   checkpoints/training_log.json    -- per-epoch metrics
 
+import argparse
 import math
 import json
 import time
@@ -49,13 +50,14 @@ N_HEADS    = 6
 CTX_LEN    = 1024
 
 # Training
-BATCH_SIZE    = 32
-EPOCHS        = 60
-LR            = 1e-4
-GRAD_CLIP     = 0.5
-EVAL_EVERY    = 1
-SAVE_EVERY    = 5
-WARMUP_STEPS  = 500   # linear ramp before cosine decay kicks in
+BATCH_SIZE        = 32
+EPOCHS            = 60    # used for fresh runs
+ADDITIONAL_EPOCHS = 40    # used when resuming with --resume
+LR                = 1e-4
+GRAD_CLIP         = 0.5
+EVAL_EVERY        = 1
+SAVE_EVERY        = 5
+WARMUP_STEPS      = 500   # linear ramp before cosine decay kicks in
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -245,6 +247,30 @@ def save_checkpoint(model, optimiser, epoch, val_loss, path):
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
+    parser = argparse.ArgumentParser(description="LogSentinel — BitNet transformer training")
+    parser.add_argument(
+        "--resume", action="store_true",
+        help=(
+            f"Resume from checkpoints/model_best.pt and train for "
+            f"{ADDITIONAL_EPOCHS} more epochs. "
+            f"Restores model + optimiser state exactly."
+        ),
+    )
+    parser.add_argument(
+        "--restart-lr", type=float, default=None, metavar="LR",
+        help=(
+            "Only valid with --resume. Start a fresh cosine decay from this LR "
+            "instead of continuing the old schedule. Useful when the model is "
+            "still underfitting and you want more aggressive learning on the "
+            "continuation run. Recommended range: 3e-5 to 5e-5. "
+            "Example: --resume --restart-lr 4e-5"
+        ),
+    )
+
+    args = parser.parse_args()
+    if args.restart_lr and not args.resume:
+        parser.error("--restart-lr only makes sense with --resume")
+
     CKPT_DIR.mkdir(exist_ok=True)
 
     print(f"Device: {DEVICE}")
@@ -282,6 +308,8 @@ def main():
         num_workers=2, pin_memory=(DEVICE.type == "cuda"),
     )
 
+    steps_per_epoch = len(train_loader)
+
     # ── Model ─────────────────────────────────────────────────────────────────
     print("\nBuilding BitNet transformer...")
     model = BitNetTransformer(
@@ -294,55 +322,98 @@ def main():
     print(f"  Float32 size: {n_params * 4 / 1e6:.2f} MB")
     print(f"  BitNet size:  {n_params * 2 / 8 / 1e6:.2f} MB  (2 bits/weight)")
 
-    # ── Optimiser + scheduler ─────────────────────────────────────────────────
-    optimiser   = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=0.1)
-    total_steps = EPOCHS * len(train_loader)
+    # ── Optimiser ─────────────────────────────────────────────────────────────
+    optimiser = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=0.1)
 
-    # Warmup + cosine decay schedule.
-    #
-    # Why warmup matters for BitLinear:
-    #   At step 0, weights are random noise. BitLinear quantises via absmean —
-    #   dividing random weights by their mean scale produces chaotic ternary
-    #   assignments and huge gradient spikes. That's the source of the NaN/Inf
-    #   skipped batches in early training.
-    #
-    #   The warmup ramp (steps 0 → WARMUP_STEPS) starts LR near zero and
-    #   increases linearly to the full LR. By the time we're doing full-speed
-    #   updates, the weights have settled into a coherent distribution and the
-    #   ternary assignments are stable. After warmup, normal cosine decay takes
-    #   over exactly as before, decaying from LR down to LR/10 by the final step.
-    #
-    # Shape:
-    #   Steps 0   → WARMUP_STEPS:  LR * step/WARMUP_STEPS   (linear ramp)
-    #   Steps WARMUP_STEPS → end:  cosine decay LR → LR/10  (same as before)
+    # ── Resume or fresh start ─────────────────────────────────────────────────
+    best_ckpt   = CKPT_DIR / "model_best.pt"
+    start_epoch = 0
+    best_val_loss = float("inf")
+    log = []
+
+    if args.resume:
+        if not best_ckpt.exists():
+            raise FileNotFoundError(
+                f"--resume requires {best_ckpt} to exist. "
+                f"Run without --resume first."
+            )
+        print(f"\nResuming from {best_ckpt}...")
+        ckpt = torch.load(best_ckpt, map_location=DEVICE, weights_only=True)
+        model.load_state_dict(ckpt["model_state"])
+        optimiser.load_state_dict(ckpt["optim_state"])
+        start_epoch   = ckpt["epoch"]
+        best_val_loss = ckpt["val_loss"]
+        print(f"  Restored epoch {start_epoch}  val_loss={best_val_loss:.4f}")
+
+        # Restore the training log so history is preserved
+        log_path = CKPT_DIR / "training_log.json"
+        if log_path.exists():
+            log = json.loads(log_path.read_text())
+            print(f"  Training log restored  ({len(log)} entries)")
+
+    # ── Scheduler ─────────────────────────────────────────────────────────────
+    target_epochs = start_epoch + ADDITIONAL_EPOCHS if args.resume else EPOCHS
+    total_steps   = target_epochs * steps_per_epoch
+    steps_done    = start_epoch * steps_per_epoch
 
     LR_MIN = LR / 10
 
-    def lr_lambda(step: int) -> float:
-        if step < WARMUP_STEPS:
-            # Linear warmup: fraction of full LR
-            return (step + 1) / WARMUP_STEPS
-        # Cosine decay over the remaining steps
-        progress = (step - WARMUP_STEPS) / max(total_steps - WARMUP_STEPS, 1)
-        cosine   = 0.5 * (1 + math.cos(math.pi * progress))
-        # Scale so the lambda returns a multiplier on the base LR
-        return (LR_MIN + (LR - LR_MIN) * cosine) / LR
+    if args.resume and args.restart_lr:
+        # Cosine restart — fresh decay from restart_lr → LR_MIN over the new
+        # 40 epochs. Weights are stable so no warmup needed. The optimiser LR
+        # is patched to the restart value so AdamW momentum is preserved but
+        # the step size is reset to where we want it.
+        restart_lr    = args.restart_lr
+        restart_steps = ADDITIONAL_EPOCHS * steps_per_epoch
 
-    scheduler = torch.optim.lr_scheduler.LambdaLR(optimiser, lr_lambda=lr_lambda)
+        for pg in optimiser.param_groups:
+            pg["lr"] = restart_lr
+
+        def lr_lambda(step: int) -> float:
+            progress = step / max(restart_steps, 1)
+            cosine   = 0.5 * (1 + math.cos(math.pi * progress))
+            return (LR_MIN + (restart_lr - LR_MIN) * cosine) / restart_lr
+
+        # Fresh scheduler starting from step 0 of the restart
+        scheduler = torch.optim.lr_scheduler.LambdaLR(
+            optimiser, lr_lambda=lr_lambda, last_epoch=-1,
+        )
+        print(f"\n  LR restart: {restart_lr:.1e} → {LR_MIN:.1e} "
+              f"over {ADDITIONAL_EPOCHS} epochs  (fresh cosine)")
+
+    else:
+        # Continue the original cosine curve from where it left off.
+        # last_epoch fast-forwards the scheduler to steps_done so the LR
+        # picks up at the correct position on the decay curve.
+        def lr_lambda(step: int) -> float:
+            if step < WARMUP_STEPS:
+                return (step + 1) / WARMUP_STEPS
+            progress = (step - WARMUP_STEPS) / max(total_steps - WARMUP_STEPS, 1)
+            cosine   = 0.5 * (1 + math.cos(math.pi * progress))
+            return (LR_MIN + (LR - LR_MIN) * cosine) / LR
+
+        scheduler = torch.optim.lr_scheduler.LambdaLR(
+            optimiser, lr_lambda=lr_lambda,
+            last_epoch=steps_done - 1 if steps_done > 0 else -1,
+        )
 
     # ── Training loop ─────────────────────────────────────────────────────────
-    print(f"\nTraining for {EPOCHS} epochs...")
+    extra = ADDITIONAL_EPOCHS if args.resume else EPOCHS
+    print(f"\n{'Resuming' if args.resume else 'Training'} for {extra} epochs "
+          f"(epochs {start_epoch + 1} → {target_epochs})...")
     print(f"  Batch size:   {BATCH_SIZE}")
-    print(f"  Steps/epoch:  {len(train_loader):,}")
-    print(f"  Total steps:  {total_steps:,}")
-    print(f"  Warmup steps: {WARMUP_STEPS}  (~{WARMUP_STEPS / len(train_loader):.1f} epochs)\n")
+    print(f"  Steps/epoch:  {steps_per_epoch:,}")
+    print(f"  Total steps:  {target_epochs * steps_per_epoch:,}")
+    if not args.resume:
+        print(f"  Warmup steps: {WARMUP_STEPS}  (~{WARMUP_STEPS / steps_per_epoch:.1f} epochs)")
+    elif not args.restart_lr:
+        current_lr = scheduler.get_last_lr()[0]
+        print(f"  Resuming LR:  {current_lr:.2e}  (cosine position {steps_done}/{total_steps})")
+    print()
 
-    log            = []
-    best_val_loss  = float("inf")
-    best_ckpt      = CKPT_DIR / "model_best.pt"
-    scaler         = torch.cuda.amp.GradScaler(enabled=False)  # disabled — BitLinear + fp16 overflows
+    scaler = torch.cuda.amp.GradScaler(enabled=False)
 
-    for epoch in range(1, EPOCHS + 1):
+    for epoch in range(start_epoch + 1, target_epochs + 1):
         model.train()
         epoch_loss  = 0.0
         epoch_start = time.time()
@@ -353,7 +424,6 @@ def main():
             with torch.cuda.amp.autocast(enabled=False):
                 loss = compute_loss(model, batch, DEVICE)
 
-            # Skip batch if loss is NaN or Inf (can happen with BitLinear)
             if not torch.isfinite(loss):
                 optimiser.zero_grad()
                 scheduler.step()
@@ -370,14 +440,14 @@ def main():
             if (step + 1) % 50 == 0:
                 avg = epoch_loss / (step + 1)
                 lr  = scheduler.get_last_lr()[0]
-                print(f"  Epoch {epoch:3d} | step {step+1:4d}/{len(train_loader)} "
+                print(f"  Epoch {epoch:3d} | step {step+1:4d}/{steps_per_epoch} "
                       f"| loss {avg:.4f} | lr {lr:.2e}")
 
-        train_loss        = epoch_loss / len(train_loader)
+        train_loss        = epoch_loss / steps_per_epoch
         val_loss, val_ppl = evaluate(model, val_loader, DEVICE)
         elapsed           = time.time() - epoch_start
 
-        print(f"\nEpoch {epoch:3d}/{EPOCHS} -- "
+        print(f"\nEpoch {epoch:3d}/{target_epochs} -- "
               f"train: {train_loss:.4f}  "
               f"val: {val_loss:.4f}  "
               f"ppl: {val_ppl:.2f}  "
@@ -401,7 +471,7 @@ def main():
                             CKPT_DIR / f"model_epoch_{epoch:03d}.pt")
 
     # ── Save final checkpoint ─────────────────────────────────────────────────
-    save_checkpoint(model, optimiser, EPOCHS, val_loss,
+    save_checkpoint(model, optimiser, target_epochs, val_loss,
                     CKPT_DIR / "model_final.pt")
 
     print(f"\nTraining complete.")

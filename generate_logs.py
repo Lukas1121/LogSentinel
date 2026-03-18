@@ -25,8 +25,16 @@ Anomaly types implemented
   mfa_disabled        — MFA removed from an account
   new_country_login   — first-ever login from a foreign country
   brute_force         — 10+ failed logins in 60 seconds
+
+Flags
+-----
+  --train-only   Generate train.jsonl only. Skips val.jsonl and
+                 anomaly_test.jsonl. Use when resuming training with an
+                 existing tokeniser vocab — val/test tensors are already
+                 in the repo and must not be regenerated.
 """
 
+import argparse
 import json
 import random
 import uuid
@@ -499,20 +507,14 @@ class AnomalyInjector:
         return event
 
     def impossible_travel(self, dt: datetime) -> list[dict]:
-        """
-        User logs in from Denmark, then 8 minutes later from a foreign country.
-        Physically impossible — flags as credential compromise.
-        """
         user      = random.choice(self.users)
         dk_loc    = user.home_location
         for_loc   = random.choice(FOREIGN_LOCATIONS)
         dk_ip     = random_ip(dk_loc["ip_prefix"])
         for_ip    = random_ip(for_loc["ip_prefix"])
-
         e1 = self.sampler.sample(user, dt,
                                   operation="UserLoggedIn",
                                   ip=dk_ip, location=dk_loc)
-
         e2 = self.sampler.sample(user, dt + timedelta(minutes=8),
                                   operation="UserLoggedIn",
                                   ip=for_ip, location=for_loc)
@@ -520,14 +522,9 @@ class AnomalyInjector:
         return [e1, e2]
 
     def off_hours_admin(self, dt: datetime) -> list[dict]:
-        """
-        Admin performs privileged operation at 3 am.
-        Could indicate account takeover or insider threat.
-        """
         admins = [u for u in self.users if u.is_admin]
         if not admins:
             admins = self.users
-
         user    = random.choice(admins)
         night   = dt.replace(hour=3, minute=random.randint(0, 59))
         op      = random.choice(["Disable account", "Reset user password.",
@@ -536,10 +533,6 @@ class AnomalyInjector:
         return [self._tag(event, "off_hours_admin")]
 
     def mass_download(self, dt: datetime) -> list[dict]:
-        """
-        User downloads 50+ files within 5 minutes.
-        Flags potential data exfiltration.
-        """
         user   = random.choice(self.users)
         events = []
         for i in range(random.randint(8, 12)):
@@ -550,15 +543,9 @@ class AnomalyInjector:
         return events
 
     def mfa_disabled(self, dt: datetime) -> list[dict]:
-        """
-        MFA authentication method removed from a user account.
-        High-severity security event.
-        """
-        # Actor is an admin, target is a regular user
         admins = [u for u in self.users if u.is_admin] or self.users
         actor  = random.choice(admins)
         target = random.choice([u for u in self.users if not u.is_admin])
-
         event = self.sampler.sample(actor, dt,
                                     operation="Disable Strong Authentication")
         event["Target"] = [{"Type": 2, "ID": target.upn}]
@@ -570,9 +557,6 @@ class AnomalyInjector:
         return [self._tag(event, "mfa_disabled")]
 
     def new_country_login(self, dt: datetime) -> list[dict]:
-        """
-        User logs in from a country they have never used before.
-        """
         user    = random.choice(self.users)
         for_loc = random.choice(FOREIGN_LOCATIONS)
         for_ip  = random_ip(for_loc["ip_prefix"])
@@ -582,10 +566,6 @@ class AnomalyInjector:
         return [self._tag(event, "new_country_login")]
 
     def brute_force(self, dt: datetime) -> list[dict]:
-        """
-        10+ failed logins from the same IP within 60 seconds.
-        Classic credential-stuffing or brute-force pattern.
-        """
         user   = random.choice(self.users)
         ip     = random_ip(random.choice(FOREIGN_LOCATIONS)["ip_prefix"])
         loc    = random.choice(FOREIGN_LOCATIONS)
@@ -647,14 +627,12 @@ def build_anomaly_test_dataset(
     n_normal   = int(n * (1 - ANOMALY_RATIO))
     normal_evs = build_normal_dataset(sampler, users, n_normal, start, end)
 
-    # Generate anomalies
     anomaly_evs = []
     n_anomalies = n - n_normal
     anomaly_timestamps = generate_timestamps(n_anomalies, start, end)
     for dt in anomaly_timestamps:
         anomaly_evs.extend(injector.random_anomaly(dt))
 
-    # Merge + sort
     all_events = normal_evs + anomaly_evs
     all_events.sort(key=lambda e: e["CreationTime"])
     return all_events
@@ -673,18 +651,31 @@ def write_jsonl(events: list[dict], path: Path):
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
+    parser = argparse.ArgumentParser(
+        description="Synthetic M365 audit log generator"
+    )
+    parser.add_argument(
+        "--train-only", action="store_true", dest="train_only",
+        help=(
+            "Generate train.jsonl only. Skips val.jsonl and anomaly_test.jsonl. "
+            "Use when resuming training — val/test tensors are already in the "
+            "repo and regenerating them would invalidate the existing test labels."
+        ),
+    )
+    args = parser.parse_args()
+
     print("=" * 60)
     print("  Synthetic M365 Audit Log Generator")
+    if args.train_only:
+        print("  Mode: --train-only (val + test skipped)")
     print("=" * 60)
 
-    # Date range: 90 days of activity (matches M365 default retention)
     end   = datetime(2024, 12, 31, 23, 59, 59)
     start = end - timedelta(days=90)
     print(f"\n  Period:  {start.date()} → {end.date()}  (90 days)")
     print(f"  Users:   {N_USERS}")
     print(f"  Domain:  {ORG_DOMAIN}")
 
-    # Build user pool
     print("\nGenerating user profiles...")
     users = [UserProfile(i) for i in range(N_USERS)]
     admins = sum(1 for u in users if u.is_admin)
@@ -693,38 +684,36 @@ def main():
     sampler  = EventSampler(users)
     injector = AnomalyInjector(sampler, users)
 
-    # Training set (normal only)
     print(f"\nGenerating training set ({N_TRAIN:,} events)...")
     train_events = build_normal_dataset(sampler, users, N_TRAIN, start, end)
 
-    # Validation set (normal only)
-    print(f"Generating validation set ({N_VAL:,} events)...")
-    val_events = build_normal_dataset(sampler, users, N_VAL, start, end)
+    if not args.train_only:
+        print(f"Generating validation set ({N_VAL:,} events)...")
+        val_events = build_normal_dataset(sampler, users, N_VAL, start, end)
 
-    # Anomaly test set
-    print(f"Generating anomaly test set ({N_ANOMALY_TEST:,} events)...")
-    test_events = build_anomaly_test_dataset(
-        sampler, injector, users, N_ANOMALY_TEST, start, end
-    )
-    n_anomalous = sum(1 for e in test_events if "_anomaly" in e)
-    print(f"  Anomalous events: {n_anomalous} / {len(test_events)}")
+        print(f"Generating anomaly test set ({N_ANOMALY_TEST:,} events)...")
+        test_events = build_anomaly_test_dataset(
+            sampler, injector, users, N_ANOMALY_TEST, start, end
+        )
+        n_anomalous = sum(1 for e in test_events if "_anomaly" in e)
+        print(f"  Anomalous events: {n_anomalous} / {len(test_events)}")
 
-    # Write
     print("\nWriting JSONL files...")
     write_jsonl(train_events, OUT_DIR / "train.jsonl")
-    write_jsonl(val_events,   OUT_DIR / "val.jsonl")
-    write_jsonl(test_events,  OUT_DIR / "anomaly_test.jsonl")
 
-    # Summary
-    print("\nAnomaly breakdown in test set:")
-    from collections import Counter
-    counts = Counter(
-        e["_anomaly"]["type"]
-        for e in test_events
-        if "_anomaly" in e
-    )
-    for atype, count in sorted(counts.items()):
-        print(f"  {atype:<25} {count:>4} events")
+    if not args.train_only:
+        write_jsonl(val_events,   OUT_DIR / "val.jsonl")
+        write_jsonl(test_events,  OUT_DIR / "anomaly_test.jsonl")
+
+        print("\nAnomaly breakdown in test set:")
+        from collections import Counter
+        counts = Counter(
+            e["_anomaly"]["type"]
+            for e in test_events
+            if "_anomaly" in e
+        )
+        for atype, count in sorted(counts.items()):
+            print(f"  {atype:<25} {count:>4} events")
 
     print("\nDone. Data ready in data/")
 

@@ -319,7 +319,62 @@ def recompute_scores():
     val_mean = val_scores.mean().item()
     val_std  = val_scores.std().item()
 
+    # Save results to JSON so run_and_exit.sh can read the summary
+    # and subsequent detect.py calls can use --load instead of --recompute.
+    save_scores(test_scores, test_labels.bool(), val_mean, val_std,
+                n_sigma=2.0, ckpt_epoch=ckpt["epoch"])
+
     return test_scores, test_labels.bool(), val_mean, val_std
+
+
+def save_scores(test_scores: torch.Tensor, labels: torch.Tensor,
+                val_mean: float, val_std: float,
+                n_sigma: float = 2.0, ckpt_epoch: int = 0):
+    """
+    Write results/anomaly_scores.json in the same format the old
+    train_transformer.py produced, so run_and_exit.sh and load_saved_scores()
+    both work correctly after a --recompute run.
+    """
+    RES_DIR.mkdir(exist_ok=True)
+
+    threshold = val_mean + n_sigma * val_std
+    m_global  = metrics_at_threshold(test_scores, labels, threshold)
+
+    # Perfect-recall threshold — just below the lowest anomaly score
+    anom_scores       = test_scores[labels]
+    threshold_perfect = anom_scores.min().item() * 0.999
+    m_perfect         = metrics_at_threshold(test_scores, labels, threshold_perfect)
+
+    results = {
+        "val_score_mean":    round(val_mean, 4),
+        "val_score_std":     round(val_std,  4),
+        "global_threshold":  round(threshold, 4),
+        "perfect_threshold": round(threshold_perfect, 4),
+        "n_sigma":           n_sigma,
+        "checkpoint_epoch":  ckpt_epoch,
+        "test_windows":      len(test_scores),
+        "anomalous_windows": int(labels.sum()),
+        "global": {
+            "tp": m_global["tp"], "fp": m_global["fp"],
+            "fn": m_global["fn"], "tn": m_global["tn"],
+            "precision": round(m_global["precision"], 4),
+            "recall":    round(m_global["recall"],    4),
+            "f1":        round(m_global["f1"],        4),
+        },
+        "perfect_recall": {
+            "tp": m_perfect["tp"], "fp": m_perfect["fp"],
+            "fn": m_perfect["fn"], "tn": m_perfect["tn"],
+            "precision": round(m_perfect["precision"], 4),
+            "recall":    round(m_perfect["recall"],    4),
+            "f1":        round(m_perfect["f1"],        4),
+        },
+        "test_scores": test_scores.tolist(),
+        "test_labels": labels.tolist(),
+    }
+
+    out = RES_DIR / "anomaly_scores.json"
+    out.write_text(json.dumps(results, indent=2))
+    print(f"  Results saved -> {out}")
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
