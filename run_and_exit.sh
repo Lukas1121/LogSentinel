@@ -15,9 +15,10 @@
 #   Step 2 -- Generate synthetic M365 logs  (generate_logs.py)
 #   Step 3 -- Tokenise logs                 (tokenise_logs.py)
 #   Step 4 -- Train BitNet transformer      (train_transformer.py)
-#   Step 5 -- Push results to GitHub + terminate pod
+#   Step 5 -- Evaluate anomaly detection    (detect.py)
+#   Step 6 -- Push results to GitHub + terminate pod
 #
-# EXPECTED RUNTIME ON A100:  ~10 minutes total
+# EXPECTED RUNTIME ON A100:  ~12 minutes total
 # =============================================================================
 
 GITHUB_TOKEN="${GITHUB_TOKEN:?ERROR: export GITHUB_TOKEN=ghp_xxx before running}"
@@ -25,13 +26,12 @@ RUNPOD_API_KEY="${RUNPOD_API_KEY:?ERROR: export RUNPOD_API_KEY=xxx before runnin
 GITHUB_USER="${GITHUB_USER:-Lukas1121}"
 REPO_NAME="${REPO_NAME:-LogSentinel}"
 
-# RunPod sets RUNPOD_POD_ID in most templates, fall back to unknown
 RUNPOD_POD_ID="${RUNPOD_POD_ID:-$(curl -sf http://169.254.169.254/latest/meta-data/instance-id 2>/dev/null || echo "unknown")}"
 
 BRANCH="main"
 TRAIN_EXIT=0
+DETECT_EXIT=0
 
-# Force Python to flush output immediately — prevents step logs appearing in batches
 export PYTHONUNBUFFERED=1
 
 log() { echo "[$(date '+%H:%M:%S')] $*"; }
@@ -66,18 +66,17 @@ push_to_github() {
 
     mkdir -p checkpoints results data
 
-    git add -f checkpoints/model_best.pt    2>/dev/null || true
-    git add -f checkpoints/model_final.pt   2>/dev/null || true
-    git add -f checkpoints/training_log.json 2>/dev/null || true
-    git add -f results/anomaly_scores.json  2>/dev/null || true
-    git add -f results/stage2_results.json  2>/dev/null || true
-    git add -f results/stage2_alerts.json   2>/dev/null || true
-    git add -f data/tokeniser.json          2>/dev/null || true
-    git add -f data/val_user_ids.json       2>/dev/null || true
-    git add -f data/test_user_ids.json      2>/dev/null || true
-    git add -f training.log                 2>/dev/null || true
+    git add -f checkpoints/model_best.pt        2>/dev/null || true
+    git add -f checkpoints/model_final.pt       2>/dev/null || true
+    git add -f checkpoints/training_log.json    2>/dev/null || true
+    git add -f results/anomaly_scores.json      2>/dev/null || true
+    git add -f results/stage2_results.json      2>/dev/null || true
+    git add -f results/stage2_alerts.json       2>/dev/null || true
+    git add -f data/tokeniser.json              2>/dev/null || true
+    git add -f data/val_user_ids.json           2>/dev/null || true
+    git add -f data/test_user_ids.json          2>/dev/null || true
+    git add -f training.log                     2>/dev/null || true
 
-    # data/*.pt files can be large -- only push if under 90MB each
     for pt in data/train_tokens.pt data/val_tokens.pt data/test_tokens.pt data/test_labels.pt; do
         if [ -f "$pt" ]; then
             size=$(du -m "$pt" | cut -f1)
@@ -92,7 +91,7 @@ push_to_github() {
     if git diff --cached --quiet; then
         log "  Nothing staged -- check training.log for errors"
     else
-        git commit -m "Auto: pod=$RUNPOD_POD_ID train_exit=$TRAIN_EXIT [$(date '+%Y-%m-%d %H:%M')]"
+        git commit -m "Auto: pod=$RUNPOD_POD_ID train_exit=$TRAIN_EXIT detect_exit=$DETECT_EXIT [$(date '+%Y-%m-%d %H:%M')]"
         if git push origin "$BRANCH"; then
             log "  SUCCESS -- results pushed to GitHub on branch $BRANCH"
         else
@@ -142,10 +141,8 @@ log "  Cloned into $(pwd)"
 
 # ── Step 1 -- Dependencies ────────────────────────────────────────────────────
 log ""
-log "STEP 1/4: Installing dependencies..."
+log "STEP 1/5: Installing dependencies..."
 
-# RunPod A100 images ship with PyTorch pre-installed.
-# Only install if missing to avoid a slow 2GB download.
 if python3 -c "import torch" 2>/dev/null; then
     log "  PyTorch already installed -- skipping pip install"
 else
@@ -156,7 +153,6 @@ else
     fi
 fi
 
-# Verify torch is available
 python3 -c "import torch; print(f'  PyTorch {torch.__version__}  CUDA={torch.cuda.is_available()}')"
 if [ $? -ne 0 ]; then
     log "ERROR: PyTorch not importable after install. Cannot continue."
@@ -174,8 +170,7 @@ log "  Dependencies ready"
 
 # ── Step 2 -- Generate synthetic logs ─────────────────────────────────────────
 log ""
-log "STEP 2/4: Generating synthetic M365 audit logs..."
-log "  80k training + 20k val + 2k anomaly test events"
+log "STEP 2/5: Generating synthetic M365 audit logs..."
 
 python3 generate_logs.py
 if [ $? -ne 0 ]; then
@@ -183,7 +178,6 @@ if [ $? -ne 0 ]; then
     exit 1
 fi
 
-# Verify output
 for f in data/train.jsonl data/val.jsonl data/anomaly_test.jsonl; do
     lines=$(wc -l < "$f")
     log "  $f: $lines events"
@@ -193,7 +187,7 @@ log "  Log generation complete"
 
 # ── Step 3 -- Tokenise ────────────────────────────────────────────────────────
 log ""
-log "STEP 3/4: Tokenising logs..."
+log "STEP 3/5: Tokenising logs..."
 
 python3 tokenise_logs.py
 if [ $? -ne 0 ]; then
@@ -201,14 +195,12 @@ if [ $? -ne 0 ]; then
     exit 1
 fi
 
-# Print vocab size
 python3 -c "
 import json
 tok = json.load(open('data/tokeniser.json'))
 print(f'  Vocab size: {len(tok[\"id2tok\"])} tokens')
 "
 
-# Verify tensors exist
 for f in data/train_tokens.pt data/val_tokens.pt data/test_tokens.pt data/test_labels.pt; do
     if [ -f "$f" ]; then
         size=$(du -h "$f" | cut -f1)
@@ -223,9 +215,8 @@ log "  Tokenisation complete"
 
 # ── Step 4 -- Train ───────────────────────────────────────────────────────────
 log ""
-log "STEP 4/4: Training BitNet transformer..."
-log "  Architecture: 4 layers, 128 dim, 4 heads, ~1.5M params"
-log "  30 epochs on A100 ~= 10 minutes"
+log "STEP 4/5: Training BitNet transformer..."
+log "  Architecture: 4 layers, 192 dim, 6 heads, ~2M params, CTX_LEN=1024"
 
 python3 train_transformer.py
 TRAIN_EXIT=$?
@@ -236,32 +227,59 @@ if [ $TRAIN_EXIT -ne 0 ]; then
 else
     log "  Training complete"
 
-    # Print the headline number
-    if [ -f "results/anomaly_scores.json" ]; then
+    # Print val perplexity from the training log
+    if [ -f "checkpoints/training_log.json" ]; then
         python3 -c "
-import json
-r = json.load(open('results/anomaly_scores.json'))
-p = r['perfect_recall']
-g = r['global']
+import json, math
+log = json.load(open('checkpoints/training_log.json'))
+best = min(log, key=lambda e: e['val_loss'])
 print()
 print('  =========================================')
-print(f'  Val score mean:  {r[\"val_score_mean\"]:.2f} (std={r[\"val_score_std\"]:.2f})')
-print(f'  Global threshold: {r[\"global_threshold\"]:.2f}')
-print()
-print(f'  Global threshold results:')
-print(f'    Recall:    {g[\"recall\"]:.3f}  FN={g[\"fn\"]}')
-print(f'    Precision: {g[\"precision\"]:.3f}')
-print()
-print(f'  Perfect-recall results:')
-print(f'    Recall:    {p[\"recall\"]:.3f}  FN={p[\"fn\"]}')
-print(f'    Precision: {p[\"precision\"]:.3f}')
-print(f'    F1:        {p[\"f1\"]:.3f}')
+print(f'  Best epoch:       {best[\"epoch\"]}')
+print(f'  Best val loss:    {best[\"val_loss\"]:.4f}')
+print(f'  Best val ppl:     {best[\"val_perplexity\"]:.2f}')
 print('  =========================================')
-print()
-print('  This is your LinkedIn headline number.')
 "
     fi
 fi
 
-log "STEP 5/4: Cleanup trap will push results and terminate pod..."
+# ── Step 5 -- Anomaly detection evaluation ────────────────────────────────────
+log ""
+log "STEP 5/5: Running anomaly detection evaluation (detect.py)..."
+
+# Default: sigma sweep so we can see the full operating curve in the log.
+# To use a fixed sigma, change to: python3 detect.py --sigma 2.0 --stage2
+python3 detect.py --recompute --pr-curve
+DETECT_EXIT=$?
+
+if [ $DETECT_EXIT -ne 0 ]; then
+    log "WARNING: detect.py exited with code $DETECT_EXIT"
+else
+    log "  Detection evaluation complete"
+
+    # Print the headline numbers if anomaly_scores.json was written
+    if [ -f "results/anomaly_scores.json" ]; then
+        python3 -c "
+import json
+r = json.load(open('results/anomaly_scores.json'))
+g = r['global']
+print()
+print('  =========================================')
+print(f'  Val score mean:   {r[\"val_score_mean\"]:.2f} (std={r[\"val_score_std\"]:.2f})')
+print(f'  Global threshold: {r[\"global_threshold\"]:.2f}  (sigma=2.0)')
+print()
+print(f'  Global threshold results:')
+print(f'    TP={g[\"tp\"]}  FP={g[\"fp\"]}  FN={g[\"fn\"]}  TN={g[\"tn\"]}')
+print(f'    Precision: {g[\"precision\"]:.3f}')
+print(f'    Recall:    {g[\"recall\"]:.3f}')
+print(f'    F1:        {g[\"f1\"]:.3f}')
+print('  =========================================')
+print()
+print('  Tune sigma with: python3 detect.py --sigma <value>')
+"
+    fi
+fi
+
+log ""
+log "STEP 6: Cleanup trap will push results and terminate pod..."
 # trap fires here automatically on EXIT

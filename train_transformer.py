@@ -1,34 +1,30 @@
 # train_transformer.py
 # BitNet b1.58 decoder-only transformer for M365 audit log anomaly detection.
 #
+# Responsibility: training only.
+# Anomaly detection, threshold tuning, and Stage 2 filtering live in detect.py.
+#
 # Architecture:
-#   Vocabulary:      256 tokens  (actual ~137, padded to next power of 2)
-#   Embedding dim:   128
+#   Vocabulary:      2048 tokens  (actual ~1150 with 1000 users, padded to next power of 2)
+#   Embedding dim:   192
 #   Layers:          4
-#   Attention heads: 4
-#   Context length:  128 tokens  (~12 log events per window)
-#   Parameters:      ~1.5M
+#   Attention heads: 6
+#   Context length:  1024 tokens  (~72 events of per-user history)
+#   Parameters:      ~2M
 #
 # Training objective: next-token prediction (cross-entropy).
 # Lower validation perplexity = better model of normal behaviour.
 #
-# After training, anomaly detection works by:
-#   1. Computing per-window perplexity on the test set.
-#   2. Setting threshold = mean + 2*std on val set perplexity.
-#   3. Windows above threshold are flagged as anomalous.
-#   4. Scoring against ground truth labels -> precision / recall / F1.
-#
 # Inputs:
-#   data/train_tokens.pt    LongTensor (N, 128)
-#   data/val_tokens.pt      LongTensor (N, 128)
-#   data/test_tokens.pt     LongTensor (N, 128)
-#   data/test_labels.pt     BoolTensor (N,)
+#   data/train_tokens.pt    LongTensor (N, CTX_LEN)
+#   data/val_tokens.pt      LongTensor (N, CTX_LEN)
 #   data/tokeniser.json     vocab metadata
 #
 # Outputs:
-#   checkpoints/model_best.pt
-#   checkpoints/training_log.json
-#   results/anomaly_scores.json
+#   checkpoints/model_best.pt        -- best val loss checkpoint
+#   checkpoints/model_final.pt       -- final epoch checkpoint
+#   checkpoints/model_epoch_NNN.pt   -- periodic checkpoints
+#   checkpoints/training_log.json    -- per-epoch metrics
 
 import math
 import json
@@ -44,27 +40,25 @@ from torch.utils.data import Dataset, DataLoader
 
 DATA_DIR  = Path("data")
 CKPT_DIR  = Path("checkpoints")
-RES_DIR   = Path("results")
 
 # Model
-VOCAB      = 2048    # next power of 2 above v2 vocab with 1000 users (~1150 tokens)
-EMB_DIM    = 192    # reduced — 192 overfits with only 50 users
+VOCAB      = 2048
+EMB_DIM    = 192
 N_LAYERS   = 4
 N_HEADS    = 6
-CTX_LEN    = 1024   # 17 events of per-user history at ~15 tokens/event
+CTX_LEN    = 1024
 
 # Training
-BATCH_SIZE = 32
-EPOCHS     = 30
-LR         = 1e-4  # lowered for larger 2M param model — prevents NaN explosion
-GRAD_CLIP  = 0.5   # tighter clip — BitLinear ternary grads can spike
-EVAL_EVERY = 1
-SAVE_EVERY = 5
-
-# Anomaly threshold: flag windows above mean + N_SIGMA * std of val perplexity
-N_SIGMA    = 2.0  # Stage 1 casts a wide net — Stage 2 handles false positives
+BATCH_SIZE    = 32
+EPOCHS        = 60
+LR            = 1e-4
+GRAD_CLIP     = 0.5
+EVAL_EVERY    = 1
+SAVE_EVERY    = 5
+WARMUP_STEPS  = 500   # linear ramp before cosine decay kicks in
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
 
 # ── BitLinear ─────────────────────────────────────────────────────────────────
 
@@ -94,7 +88,7 @@ class CausalSelfAttention(nn.Module):
         self.head_dim = emb_dim // n_heads
         self.qkv      = BitLinear(emb_dim, 3 * emb_dim, bias=False)
         self.out      = BitLinear(emb_dim, emb_dim,     bias=False)
-        self.attn_drop = nn.Dropout(dropout)
+        self.attn_drop  = nn.Dropout(dropout)
         self.resid_drop = nn.Dropout(dropout)
         mask = torch.triu(torch.ones(ctx_len, ctx_len), diagonal=1).bool()
         self.register_buffer("causal_mask", mask)
@@ -169,11 +163,11 @@ class BitNetTransformer(nn.Module):
                 nn.init.normal_(m.weight, mean=0.0, std=0.02)
 
     def forward(self, token_ids: torch.Tensor) -> torch.Tensor:
-        B, T    = token_ids.shape
-        pos     = torch.arange(T, device=token_ids.device)
-        x       = self.token_emb(token_ids) + self.pos_emb(pos)
-        x       = self.blocks(x)
-        x       = self.norm(x)
+        B, T = token_ids.shape
+        pos  = torch.arange(T, device=token_ids.device)
+        x    = self.token_emb(token_ids) + self.pos_emb(pos)
+        x    = self.blocks(x)
+        x    = self.norm(x)
         return self.lm_head(x)
 
     def count_parameters(self) -> int:
@@ -230,158 +224,6 @@ def evaluate(model, loader, device):
     return mean, math.exp(mean)
 
 
-@torch.no_grad()
-def window_perplexities(model, windows: torch.Tensor, device,
-                        batch_size: int = 64,
-                        mode: str = "max") -> torch.Tensor:
-    """
-    Compute per-window anomaly scores.
-
-    mode="max"  -- maximum per-token perplexity in the window.
-                   A single anomalous event cannot hide inside a normal window.
-                   Best for high-recall detection. (DEFAULT)
-
-    mode="mean" -- mean perplexity across all non-PAD tokens.
-                   Smoothed signal, better precision but misses isolated events.
-
-    Returns a 1-D float tensor of length N_windows.
-    """
-    model.eval()
-    scores = []
-    for i in range(0, len(windows), batch_size):
-        batch  = windows[i : i + batch_size].to(device)
-        x, y   = batch[:, :-1], batch[:, 1:]
-        logits = model(x)
-        B, T, V = logits.shape
-
-        # Per-token loss
-        token_losses = F.cross_entropy(
-            logits.reshape(B * T, V),
-            y.reshape(B * T),
-            ignore_index=PAD_ID,
-            reduction="none",
-        ).reshape(B, T)
-
-        # Zero out PAD positions
-        mask = (y != PAD_ID).float()
-        token_losses = token_losses * mask
-
-        if mode == "max":
-            # Max token loss in window, then log-scale to compress range.
-            # Raw max-perplexity spans billions — log brings it to ~8-30,
-            # making threshold calibration stable and precision meaningful.
-            max_loss    = token_losses.max(dim=1).values
-            per_window  = torch.log1p(max_loss.exp())  # log(1 + e^loss)
-        else:
-            # Mean perplexity, also log-scaled for consistency
-            mean_loss  = (token_losses.sum(dim=1) /
-                          mask.sum(dim=1).clamp(min=1))
-            per_window = torch.log1p(mean_loss.exp())
-
-        scores.append(per_window.cpu())
-
-    model.train()
-    return torch.cat(scores)
-
-
-# ── Anomaly evaluation ────────────────────────────────────────────────────────
-
-def evaluate_anomaly_detection(model, device, n_sigma: float = N_SIGMA):
-    """
-    Anomaly detection evaluation with two thresholding strategies:
-
-    1. Global threshold — mean + N_sigma * std across all val windows.
-       Fast, works well for general deployment.
-
-    2. Recall-optimised threshold — set at the lowest perplexity seen
-       on the val set that still flags at least 1% of windows.
-       Maximises recall at the expense of precision.
-
-    Both are computed and reported. The recall-optimised threshold
-    is used for the final metrics since the goal is to miss nothing.
-    """
-    print("\nRunning anomaly detection evaluation...")
-    RES_DIR.mkdir(exist_ok=True)
-
-    val_windows  = torch.load(DATA_DIR / "val_tokens.pt",  weights_only=True)
-    test_windows = torch.load(DATA_DIR / "test_tokens.pt", weights_only=True)
-    test_labels  = torch.load(DATA_DIR / "test_labels.pt", weights_only=True)
-
-    print("  Computing val scores (max token perplexity)...")
-    val_scores  = window_perplexities(model, val_windows,  device, mode="max")
-    print("  Computing test scores (max token perplexity)...")
-    test_scores = window_perplexities(model, test_windows, device, mode="max")
-
-    # Global threshold from val distribution
-    mu, sigma     = val_scores.mean().item(), val_scores.std().item()
-    threshold     = mu + n_sigma * sigma
-    print(f"\n  Val score:  mean={mu:.2f}  std={sigma:.2f}")
-    print(f"  Threshold ({n_sigma}s): {threshold:.2f}")
-
-    # Score test windows
-    predicted = test_scores > threshold
-    labels    = test_labels
-    tp = (predicted &  labels).sum().item()
-    fp = (predicted & ~labels).sum().item()
-    fn = (~predicted & labels).sum().item()
-    tn = (~predicted & ~labels).sum().item()
-    precision = tp / max(tp + fp, 1)
-    recall    = tp / max(tp + fn, 1)
-    f1        = 2 * precision * recall / max(precision + recall, 1e-8)
-
-    # Perfect-recall threshold — just below the lowest anomaly score
-    anom_scores       = test_scores[labels]
-    threshold_perfect = anom_scores.min().item() * 0.999
-    pred_p = test_scores > threshold_perfect
-    tp_p = (pred_p &  labels).sum().item()
-    fp_p = (pred_p & ~labels).sum().item()
-    fn_p = (~pred_p & labels).sum().item()
-    tn_p = (~pred_p & ~labels).sum().item()
-    prec_p = tp_p / max(tp_p + fp_p, 1)
-    rec_p  = tp_p / max(tp_p + fn_p, 1)
-    f1_p   = 2 * prec_p * rec_p / max(prec_p + rec_p, 1e-8)
-
-    print(f"\n  Test set results ({len(test_windows)} windows, "
-          f"{labels.sum().item()} anomalous):")
-    print(f"\n  Global threshold ({threshold:.2f}):")
-    print(f"    TP={tp}  FP={fp}  FN={fn}  TN={tn}")
-    print(f"    Precision={precision:.3f}  Recall={recall:.3f}  F1={f1:.3f}")
-    print(f"\n  Perfect-recall threshold ({threshold_perfect:.2f}):")
-    print(f"    TP={tp_p}  FP={fp_p}  FN={fn_p}  TN={tn_p}")
-    print(f"    Precision={prec_p:.3f}  Recall={rec_p:.3f}  F1={f1_p:.3f}")
-    print(f"\n  --> Missed anomalies (FN): {fn_p}  "
-          f"({'PERFECT' if fn_p == 0 else 'GOOD' if fn_p < 5 else 'REVIEW'})")
-
-    results = {
-        "val_score_mean":      round(mu, 4),
-        "val_score_std":       round(sigma, 4),
-        "global_threshold":    round(threshold, 4),
-        "perfect_threshold":   round(threshold_perfect, 4),
-        "n_sigma":             n_sigma,
-        "test_windows":        len(test_windows),
-        "anomalous_windows":   int(labels.sum()),
-        "global": {
-            "tp": tp, "fp": fp, "fn": fn, "tn": tn,
-            "precision": round(precision, 4),
-            "recall":    round(recall, 4),
-            "f1":        round(f1, 4),
-        },
-        "perfect_recall": {
-            "tp": tp_p, "fp": fp_p, "fn": fn_p, "tn": tn_p,
-            "precision": round(prec_p, 4),
-            "recall":    round(rec_p, 4),
-            "f1":        round(f1_p, 4),
-        },
-        "test_scores":  test_scores.tolist(),
-        "test_labels":  test_labels.tolist(),
-    }
-
-    out = RES_DIR / "anomaly_scores.json"
-    out.write_text(json.dumps(results, indent=2))
-    print(f"\n  Results saved -> {out}")
-    return results
-
-
 # ── Checkpoint helpers ────────────────────────────────────────────────────────
 
 def save_checkpoint(model, optimiser, epoch, val_loss, path):
@@ -404,7 +246,6 @@ def save_checkpoint(model, optimiser, epoch, val_loss, path):
 
 def main():
     CKPT_DIR.mkdir(exist_ok=True)
-    RES_DIR.mkdir(exist_ok=True)
 
     print(f"Device: {DEVICE}")
     if DEVICE.type == "cuda":
@@ -456,15 +297,45 @@ def main():
     # ── Optimiser + scheduler ─────────────────────────────────────────────────
     optimiser   = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=0.1)
     total_steps = EPOCHS * len(train_loader)
-    scheduler   = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimiser, T_max=total_steps, eta_min=LR / 10,
-    )
+
+    # Warmup + cosine decay schedule.
+    #
+    # Why warmup matters for BitLinear:
+    #   At step 0, weights are random noise. BitLinear quantises via absmean —
+    #   dividing random weights by their mean scale produces chaotic ternary
+    #   assignments and huge gradient spikes. That's the source of the NaN/Inf
+    #   skipped batches in early training.
+    #
+    #   The warmup ramp (steps 0 → WARMUP_STEPS) starts LR near zero and
+    #   increases linearly to the full LR. By the time we're doing full-speed
+    #   updates, the weights have settled into a coherent distribution and the
+    #   ternary assignments are stable. After warmup, normal cosine decay takes
+    #   over exactly as before, decaying from LR down to LR/10 by the final step.
+    #
+    # Shape:
+    #   Steps 0   → WARMUP_STEPS:  LR * step/WARMUP_STEPS   (linear ramp)
+    #   Steps WARMUP_STEPS → end:  cosine decay LR → LR/10  (same as before)
+
+    LR_MIN = LR / 10
+
+    def lr_lambda(step: int) -> float:
+        if step < WARMUP_STEPS:
+            # Linear warmup: fraction of full LR
+            return (step + 1) / WARMUP_STEPS
+        # Cosine decay over the remaining steps
+        progress = (step - WARMUP_STEPS) / max(total_steps - WARMUP_STEPS, 1)
+        cosine   = 0.5 * (1 + math.cos(math.pi * progress))
+        # Scale so the lambda returns a multiplier on the base LR
+        return (LR_MIN + (LR - LR_MIN) * cosine) / LR
+
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimiser, lr_lambda=lr_lambda)
 
     # ── Training loop ─────────────────────────────────────────────────────────
     print(f"\nTraining for {EPOCHS} epochs...")
     print(f"  Batch size:   {BATCH_SIZE}")
     print(f"  Steps/epoch:  {len(train_loader):,}")
-    print(f"  Total steps:  {total_steps:,}\n")
+    print(f"  Total steps:  {total_steps:,}")
+    print(f"  Warmup steps: {WARMUP_STEPS}  (~{WARMUP_STEPS / len(train_loader):.1f} epochs)\n")
 
     log            = []
     best_val_loss  = float("inf")
@@ -479,7 +350,7 @@ def main():
         for step, batch in enumerate(train_loader):
             optimiser.zero_grad()
 
-            with torch.cuda.amp.autocast(enabled=False):  # disabled — see scaler above
+            with torch.cuda.amp.autocast(enabled=False):
                 loss = compute_loss(model, batch, DEVICE)
 
             # Skip batch if loss is NaN or Inf (can happen with BitLinear)
@@ -502,9 +373,9 @@ def main():
                 print(f"  Epoch {epoch:3d} | step {step+1:4d}/{len(train_loader)} "
                       f"| loss {avg:.4f} | lr {lr:.2e}")
 
-        train_loss       = epoch_loss / len(train_loader)
+        train_loss        = epoch_loss / len(train_loader)
         val_loss, val_ppl = evaluate(model, val_loader, DEVICE)
-        elapsed          = time.time() - epoch_start
+        elapsed           = time.time() - epoch_start
 
         print(f"\nEpoch {epoch:3d}/{EPOCHS} -- "
               f"train: {train_loss:.4f}  "
@@ -529,30 +400,14 @@ def main():
             save_checkpoint(model, optimiser, epoch, val_loss,
                             CKPT_DIR / f"model_epoch_{epoch:03d}.pt")
 
-    # ── Save final + run anomaly evaluation ───────────────────────────────────
+    # ── Save final checkpoint ─────────────────────────────────────────────────
     save_checkpoint(model, optimiser, EPOCHS, val_loss,
                     CKPT_DIR / "model_final.pt")
 
     print(f"\nTraining complete.")
     print(f"  Best val loss:       {best_val_loss:.4f}")
     print(f"  Best val perplexity: {math.exp(best_val_loss):.2f}")
-
-    # Load best model for evaluation (not the final epoch weights)
-    print("\nLoading best checkpoint for anomaly evaluation...")
-    ckpt = torch.load(best_ckpt, map_location=DEVICE, weights_only=True)
-    model.load_state_dict(ckpt["model_state"])
-
-    results = evaluate_anomaly_detection(model, DEVICE)
-
-    print(f"\nDone.")
-    r = results["perfect_recall"]
-    print(f"  Perfect-recall results:")
-    print(f"    Recall:    {r['recall']:.3f}  (missed: {r['fn']})")
-    print(f"    Precision: {r['precision']:.3f}")
-    print(f"    F1:        {r['f1']:.3f}")
-    print(f"\n  Running Stage 2 rule-based filter...")
-    import subprocess, sys
-    subprocess.run([sys.executable, "stage2_filter.py"], check=False)
+    print(f"\n  Run detect.py to evaluate anomaly detection performance.")
 
 
 if __name__ == "__main__":
