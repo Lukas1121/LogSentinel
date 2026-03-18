@@ -1,0 +1,324 @@
+[
+  {
+    "window_idx": 79,
+    "user_id": "b2dc",
+    "score": 31.7037,
+    "is_anomalous": false,
+    "stage2_flag": true
+  },
+  {
+    "window_idx": 156,
+    "user_id": "73ad",
+    "score": 29.9333,
+    "is_anomalous": false,
+    "stage2_flag": true
+  },
+  {
+    "window_idx": 207,
+    "user_id": "9286",
+    "score": 30.7093,
+    "is_anomalous": false,
+    "stage2_flag": true
+  },
+  {
+    "window_idx": 377,
+    "user_id": "520c",
+    "score": 33.624,
+    "is_anomalous": false,
+    "stage2_flag": true
+  },
+  {
+    "window_idx": 568,
+    "user_id": "aa5d",
+    "score": 26.3729,
+    "is_anomalous": false,
+    "stage2_flag": true
+  },
+  {
+    "window_idx": 615,
+    "user_id": "fd39",
+    "score": 27.388,
+    "is_anomalous": false,
+    "stage2_flag": true
+  },
+  {
+    "window_idx": 631,
+    "user_id": "f135",
+    "score": 26.6963,
+    "is_anomalous": true,
+    "stage2_flag": true
+  },
+  {
+    "window_idx": 748,
+    "user_id": "51da",
+    "score": 26.5431,
+    "is_anomalous": false,
+    "stage2_flag": true
+  },
+  {
+    "window_idx": 944,
+    "user_id": "de7c",
+    "score": 24.3192,
+    "is_anomalous": true,
+    "stage2_flag": true
+  },
+  {
+    "window_idx": 945,
+    "user_id": "de7c",
+    "score": 24.2705,
+    "is_anomalous": true,
+    "stage2_flag": true
+  },
+  {
+    "window_idx": 946,
+    "user_id": "de7c",
+    "score": 30.7523,
+    "is_anomalous": true,
+    "stage2_flag": true
+  },
+  {
+    "window_idx": 947,
+    "user_id": "8a68",
+    "score": 29.9708,
+    "is_anomalous": false,
+    "stage2_flag": true
+  },
+  {
+    "window_idx": 1190,
+    "user_id": "c212",
+    "score": 28.3246,
+    "is_anomalous": false,
+    "stage2_flag": true
+  },
+  {
+    "window_idx": 1296,
+    "user_id": "f16b",
+    "score": 24.2346,
+    "is_anomalous": false,
+    "stage2_flag": true
+  },
+  {
+    "window_idx": 1351,
+    "user_id": "f298",
+    "score": 32.3378,
+    "is_anomalous": true,
+    "stage2_flag": true
+  },
+  {
+    "window_idx": 1362,
+    "user_id": "9087",
+    "score": 30.2894,
+    "is_anomalous": false,
+    "stage2_flag": true
+  },
+  {
+    "window_idx": 1434,
+    "user_id": "a36a",
+    "score": 26.0843,
+    "is_anomalous": false,
+    "stage2_flag": true
+  },
+  {
+    "window_idx": 1522,
+    "user_id": "df07",
+    "score": 25.6479,
+    "is_anomalous": false,
+    "stage2_flag": true
+  },
+  {
+    "window_idx": 1555,
+    "user_id": "6d41",
+    "score": 32.722,
+    "is_anomalous": false,
+    "stage2_flag": true
+  },
+  {
+    "window_idx": 2271,
+    "user_id": "f991",
+    "score": 30.5107,
+    "is_anomalous": false,
+    "stage2_flag": true
+  },
+  {
+    "window_idx": 2368,
+    "user_id": "4ac6",
+    "score": 26.0318,
+    "is_anomalous": false,
+    "stage2_flag": true
+  },
+  {
+    "window_idx": 2418,
+    "user_id": "c376",
+    "score": 29.776,
+    "is_anomalous": false,
+    "stage2_flag": true
+  },
+  {
+    "window_idx": 2721,
+    "user_id": "984a",
+    "score": 31.7431,
+    "is_anomalous": false,
+    "stage2_flag": true
+  },
+  {
+    "window_idx": 2781,
+    "user_id": "72f8",
+    "score": 24.2572,
+    "is_anomalous": false,
+    "stage2_flag": true
+  },
+  {
+    "window_idx": 2865,
+    "user_id": "d4e9",
+    "score": 26.1598,
+    "is_anomalous": true,
+    "stage2_flag": true
+  },
+  {
+    "window_idx": 2866,
+    "user_id": "d4e9",
+    "score": 25.8549,
+    "is_anomalous": true,
+    "stage2_flag": true
+  },
+  {
+    "window_idx": 2917,
+    "user_id": "7ecc",
+    "score": 28.9597,
+    "is_anomalous": true,
+    "stage2_flag": true
+  },
+  {
+    "window_idx": 2967,
+    "user_id": "711e",
+    "score": 25.5103,
+    "is_anomalous": false,
+    "stage2_flag": true
+  },
+  {
+    "window_idx": 3014,
+    "user_id": "3fa9",
+    "score": 26.2477,
+    "is_anomalous": false,
+    "stage2_flag": true
+  },
+  {
+    "window_idx": 3038,
+    "user_id": "bb19",
+    "score": 26.3659,
+    "is_anomalous": false,
+    "stage2_flag": true
+  },
+  {
+    "window_idx": 3052,
+    "user_id": "5d25",
+    "score": 25.8749,
+    "is_anomalous": false,
+    "stage2_flag": true
+  },
+  {
+    "window_idx": 3145,
+    "user_id": "7b86",
+    "score": 26.9322,
+    "is_anomalous": true,
+    "stage2_flag": true
+  },
+  {
+    "window_idx": 3146,
+    "user_id": "7b86",
+    "score": 27.4187,
+    "is_anomalous": true,
+    "stage2_flag": true
+  },
+  {
+    "window_idx": 3180,
+    "user_id": "5191",
+    "score": 24.528,
+    "is_anomalous": false,
+    "stage2_flag": true
+  },
+  {
+    "window_idx": 3340,
+    "user_id": "faec",
+    "score": 26.7877,
+    "is_anomalous": false,
+    "stage2_flag": true
+  },
+  {
+    "window_idx": 3623,
+    "user_id": "71f0",
+    "score": 33.3239,
+    "is_anomalous": true,
+    "stage2_flag": true
+  },
+  {
+    "window_idx": 3624,
+    "user_id": "71f0",
+    "score": 26.8627,
+    "is_anomalous": true,
+    "stage2_flag": true
+  },
+  {
+    "window_idx": 3625,
+    "user_id": "71f0",
+    "score": 25.9096,
+    "is_anomalous": true,
+    "stage2_flag": true
+  },
+  {
+    "window_idx": 4013,
+    "user_id": "c457",
+    "score": 24.1751,
+    "is_anomalous": false,
+    "stage2_flag": true
+  },
+  {
+    "window_idx": 4046,
+    "user_id": "6911",
+    "score": 34.7895,
+    "is_anomalous": false,
+    "stage2_flag": true
+  },
+  {
+    "window_idx": 4156,
+    "user_id": "fad2",
+    "score": 30.5926,
+    "is_anomalous": false,
+    "stage2_flag": true
+  },
+  {
+    "window_idx": 4168,
+    "user_id": "cb8d",
+    "score": 27.8751,
+    "is_anomalous": false,
+    "stage2_flag": true
+  },
+  {
+    "window_idx": 4597,
+    "user_id": "87f7",
+    "score": 24.2006,
+    "is_anomalous": true,
+    "stage2_flag": true
+  },
+  {
+    "window_idx": 4768,
+    "user_id": "9f09",
+    "score": 25.9563,
+    "is_anomalous": true,
+    "stage2_flag": true
+  },
+  {
+    "window_idx": 4769,
+    "user_id": "9f09",
+    "score": 25.0338,
+    "is_anomalous": true,
+    "stage2_flag": true
+  },
+  {
+    "window_idx": 4972,
+    "user_id": "eacf",
+    "score": 28.3454,
+    "is_anomalous": false,
+    "stage2_flag": true
+  }
+]
