@@ -183,7 +183,9 @@ def event_to_tokens(event: dict) -> list[str]:
 
     tokens = [
         BOS_STR,
-        # user_hash(event.get("UserId")),
+        # usr:xxxx intentionally omitted — base model learns universal M365
+        # grammar without user identity. User tokens are added during
+        # per-tenant fine-tuning only, where real user hashes are meaningful.
         f"op:{event.get('Operation', 'UNKNOWN')}",
         f"wl:{workload}",
         f"ut:{event.get('UserType', 0)}",

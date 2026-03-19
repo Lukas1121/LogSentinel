@@ -51,13 +51,18 @@ CTX_LEN    = 1024
 
 # Training
 BATCH_SIZE        = 32
-EPOCHS            = 60    # used for fresh runs
+EPOCHS            = 40    # fresh runs — each epoch is ~3x more work than before
 ADDITIONAL_EPOCHS = 40    # used when resuming with --resume
 LR                = 1e-4
 GRAD_CLIP         = 0.5
 EVAL_EVERY        = 1
 SAVE_EVERY        = 5
 WARMUP_STEPS      = 500   # linear ramp before cosine decay kicks in
+
+# Early stopping — halts training when val loss stops improving.
+# Prevents overfitting and wasted compute on epochs that aren't helping.
+# patience=5 means stop if val loss hasn't improved in 5 consecutive epochs.
+EARLY_STOP_PATIENCE = 5
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -417,6 +422,10 @@ def main():
 
     scaler = torch.cuda.amp.GradScaler(enabled=False)
 
+    # Early stopping state
+    epochs_no_improve = 0
+    early_stopped     = False
+
     for epoch in range(start_epoch + 1, target_epochs + 1):
         model.train()
         epoch_loss  = 0.0
@@ -466,19 +475,32 @@ def main():
         (CKPT_DIR / "training_log.json").write_text(json.dumps(log, indent=2))
 
         if val_loss < best_val_loss:
-            best_val_loss = val_loss
+            best_val_loss      = val_loss
+            epochs_no_improve  = 0
             save_checkpoint(model, optimiser, epoch, val_loss, best_ckpt)
             print(f"  New best model saved  (val_loss={val_loss:.4f})")
+        else:
+            epochs_no_improve += 1
+            print(f"  No improvement — patience {epochs_no_improve}/{EARLY_STOP_PATIENCE}")
+            if epochs_no_improve >= EARLY_STOP_PATIENCE:
+                print(f"\n  Early stopping triggered — val loss has not improved "
+                      f"for {EARLY_STOP_PATIENCE} consecutive epochs.")
+                print(f"  Best val loss: {best_val_loss:.4f}  "
+                      f"(ppl={math.exp(best_val_loss):.2f})")
+                early_stopped = True
+                break
 
         if epoch % SAVE_EVERY == 0:
             save_checkpoint(model, optimiser, epoch, val_loss,
                             CKPT_DIR / f"model_epoch_{epoch:03d}.pt")
 
     # ── Save final checkpoint ─────────────────────────────────────────────────
-    save_checkpoint(model, optimiser, target_epochs, val_loss,
+    save_checkpoint(model, optimiser, epoch, val_loss,
                     CKPT_DIR / "model_final.pt")
 
     print(f"\nTraining complete.")
+    if early_stopped:
+        print(f"  Stopped early at epoch {epoch} of {target_epochs}")
     print(f"  Best val loss:       {best_val_loss:.4f}")
     print(f"  Best val perplexity: {math.exp(best_val_loss):.2f}")
     print(f"\n  Run detect.py to evaluate anomaly detection performance.")
