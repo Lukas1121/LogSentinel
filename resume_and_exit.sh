@@ -188,18 +188,16 @@ log ""
 log "STEP 2/4: Regenerating train_tokens.pt using existing vocab..."
 log "  (val/test tensors and tokeniser.json already in repo -- not touched)"
 
-# Generate fresh train.jsonl (we need new training text, just mapped to old IDs)
+# Generate fresh train.jsonl using --train-only
+# IMPORTANT: never fall back to full generation here — that would
+# overwrite val.jsonl and anomaly_test.jsonl, invalidating the
+# val/test tensors already in the repo.
 python3 generate_logs.py --train-only
-GEN_EXIT=$?
-
-if [ $GEN_EXIT -ne 0 ]; then
-    log "WARNING: generate_logs.py --train-only failed (exit $GEN_EXIT)"
-    log "  Falling back to full generation..."
-    python3 generate_logs.py
-    if [ $? -ne 0 ]; then
-        log "ERROR: generate_logs.py failed completely"
-        exit 1
-    fi
+if [ $? -ne 0 ]; then
+    log "ERROR: generate_logs.py --train-only failed"
+    log "  Check that generate_logs.py supports --train-only flag"
+    log "  Do NOT fall back to full generation — it would corrupt val/test data"
+    exit 1
 fi
 
 # Tokenise train only, locking vocab to existing tokeniser.json
@@ -228,6 +226,15 @@ log "  Data ready"
 log ""
 log "STEP 3/4: Resuming training..."
 log "  --resume --restart-lr $RESTART_LR  (+40 epochs)"
+log ""
+log "  LR schedule (cosine restart):"
+log "    Epoch 60  →  ${RESTART_LR}        (start)"
+log "    Epoch 70  →  ~3.1e-05    (midpoint)"
+log "    Epoch 80  →  ~1.9e-05    (3/4 decay)"
+log "    Epoch 99  →  1.0e-05     (end = LR/10)"
+log "  Steps/epoch will be ~3x larger than previous run (3M vs 1M events)"
+log "  Decay is spread over more gradient updates — more gradual than before"
+log ""
 
 python3 train_transformer.py --resume --restart-lr "$RESTART_LR"
 TRAIN_EXIT=$?
@@ -277,14 +284,11 @@ print('  =========================================')
 print(f'  Val score mean:   {r[\"val_score_mean\"]:.2f} (std={r[\"val_score_std\"]:.2f})')
 print(f'  Global threshold: {r[\"global_threshold\"]:.2f}  (sigma=2.0)')
 print()
-print(f'  Global threshold results:')
-print(f'    TP={g[\"tp\"]}  FP={g[\"fp\"]}  FN={g[\"fn\"]}  TN={g[\"tn\"]}')
-print(f'    Precision: {g[\"precision\"]:.3f}')
-print(f'    Recall:    {g[\"recall\"]:.3f}')
-print(f'    F1:        {g[\"f1\"]:.3f}')
+print(f'  sigma=2.0  TP={g[\"tp\"]}  FP={g[\"fp\"]}  FN={g[\"fn\"]}  Precision={g[\"precision\"]:.3f}  Recall={g[\"recall\"]:.3f}  F1={g[\"f1\"]:.3f}')
 print('  =========================================')
 print()
-print('  Tune sigma with: python3 detect.py --sigma <value>')
+print('  Run locally: python3 detect.py --recompute')
+print('  Tune sigma:  python3 detect.py --sigma 3.0 --stage2')
 "
     fi
 fi
