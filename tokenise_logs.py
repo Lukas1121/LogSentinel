@@ -183,7 +183,7 @@ def event_to_tokens(event: dict) -> list[str]:
 
     tokens = [
         BOS_STR,
-        user_hash(event.get("UserId")),
+        # user_hash(event.get("UserId")),
         f"op:{event.get('Operation', 'UNKNOWN')}",
         f"wl:{workload}",
         f"ut:{event.get('UserType', 0)}",
