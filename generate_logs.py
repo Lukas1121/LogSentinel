@@ -58,9 +58,9 @@ from pathlib import Path
 # ── Config ────────────────────────────────────────────────────────────────────
 
 SEED           = 42
-N_USERS        = 1000
-N_TRAIN        = 3_000_000
-N_VAL          = 600_000
+N_USERS        = 500
+N_TRAIN        = 5_000_000
+N_VAL          = 1_000_000
 N_ANOMALY_TEST = 50_000
 ANOMALY_RATIO  = 0.001
 OUT_DIR        = Path("data")
