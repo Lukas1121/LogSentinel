@@ -62,7 +62,7 @@ LR_FROZEN           = 2e-4  # higher LR while only user embeddings train
 LR_UNFROZEN         = 3e-5  # conservative LR when full model trains
 FREEZE_EPOCHS       = 5     # epochs with only user embeddings unfrozen
 GRAD_CLIP           = 0.5
-EARLY_STOP_PATIENCE = 4
+EARLY_STOP_PATIENCE = 5
 CTX_LEN             = 1024
 STRIDE              = 512
 N_SIGMA             = 2.0
@@ -592,7 +592,9 @@ def main():
     parser.add_argument("--base-ckpt",    default=str(BASE_CKPT))
     parser.add_argument("--base-vocab",   default=str(DATA_DIR / "tokeniser.json"))
     parser.add_argument("--out-dir",      default=None)
-    parser.add_argument("--epochs",       type=int,   default=15)
+    parser.add_argument("--epochs",       type=int,   default=500,
+                        help="Safety cap on total epochs (default: 500). "
+                             "Training stops early after 5 epochs with no improvement.")
     parser.add_argument("--freeze-epochs",type=int,   default=FREEZE_EPOCHS)
     parser.add_argument("--n-sigma",      type=float, default=N_SIGMA)
     parser.add_argument("--min-windows",  type=int,   default=10)
@@ -740,7 +742,7 @@ def main():
     unfrozen_epochs = args.epochs - args.freeze_epochs
     if unfrozen_epochs > 0:
         print(f"\n{'='*60}")
-        print(f"  Phase 2 -- Unfrozen ({unfrozen_epochs} epochs, LR={LR_UNFROZEN:.0e})")
+        print(f"  Phase 2 -- Unfrozen (until {EARLY_STOP_PATIENCE} epochs no improvement, LR={LR_UNFROZEN:.0e})")
         print(f"  All parameters train. Conservative LR preserves base knowledge.")
         print(f"{'='*60}\n")
 
@@ -823,6 +825,8 @@ def main():
             model, test_events, vocab, device,
             global_thresh, per_user_thresh,
         )
+        detection_results["val_mean"] = thresh_stats["val_mean"]
+        detection_results["val_std"]  = thresh_stats["val_std"]
         (out_dir / "anomaly_scores.json").write_text(
             json.dumps(detection_results, indent=2))
         print(f"  Results saved -> {out_dir / 'anomaly_scores.json'}")
