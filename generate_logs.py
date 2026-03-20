@@ -891,59 +891,91 @@ def main():
             "Use when resuming — val/test tensors are already in the repo."
         ),
     )
+    parser.add_argument(
+        "--seed", type=int, default=SEED,
+        help=f"Random seed (default: {SEED}). Use a different seed to simulate "
+             "a new tenant with different users and behaviour patterns."
+    )
+    parser.add_argument(
+        "--n-users", type=int, default=N_USERS, dest="n_users",
+        help=f"Number of synthetic users (default: {N_USERS}). "
+             "Use 20-50 to simulate a small SMB tenant for fine-tuning tests."
+    )
+    parser.add_argument(
+        "--output-dir", type=str, default=str(OUT_DIR), dest="output_dir",
+        help=f"Output directory for JSONL files (default: {OUT_DIR}). "
+             "Use a separate dir when generating tenant test data."
+    )
     args = parser.parse_args()
+
+    # Apply CLI overrides to module-level constants
+    random.seed(args.seed)
+    n_users    = args.n_users
+    out_dir    = Path(args.output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    # Scale event counts proportionally when n_users differs from default
+    scale      = n_users / N_USERS
+    n_train    = max(1000, int(N_TRAIN * scale))
+    n_val      = max(200,  int(N_VAL   * scale))
+    n_test     = N_ANOMALY_TEST   # keep test set size fixed
 
     print("=" * 60)
     print("  Synthetic M365 Audit Log Generator  v2")
     if args.train_only:
         print("  Mode: --train-only")
+    if args.seed != SEED:
+        print(f"  Seed: {args.seed}  (custom — simulating new tenant)")
+    if n_users != N_USERS:
+        print(f"  Users: {n_users}  (custom)")
     print("=" * 60)
 
     end   = datetime(2024, 12, 31, 23, 59, 59)
     start = end - timedelta(days=90)
-    print(f"\n  Period:  {start.date()} → {end.date()}  (90 days)")
-    print(f"  Users:   {N_USERS}")
+    print(f"\n  Period:  {start.date()} -> {end.date()}  (90 days)")
+    print(f"  Users:   {n_users}")
     print(f"  Domain:  {ORG_DOMAIN}")
+    print(f"  Output:  {out_dir}")
 
     print("\nGenerating user profiles...")
-    users = [UserProfile(i, start, end) for i in range(N_USERS)]
+    users = [UserProfile(i, start, end) for i in range(n_users)]
 
     role_counts = Counter(u.role for u in users)
     for role, count in sorted(role_counts.items()):
         avg_daily = sum(u.daily_events for u in users
-                        if u.role == role) // count
+                        if u.role == role) // max(count, 1)
         print(f"  {role:<12} {count:>4} users  (~{avg_daily} events/day avg)")
 
     holiday_users = sum(1 for u in users if u.holiday_days)
     sick_users    = sum(1 for u in users if u.sick_days)
-    print(f"\n  {holiday_users} users have a holiday block  (~30% expected)")
-    print(f"  {sick_users} users have a sick leave episode  (~15% expected)")
+    print(f"\n  {holiday_users} users have a holiday block")
+    print(f"  {sick_users} users have a sick leave episode")
 
     sampler  = EventSampler(users)
     injector = AnomalyInjector(sampler, users)
 
-    print(f"\nGenerating training set (target {N_TRAIN:,} events)...")
-    train_events = build_normal_dataset(sampler, users, N_TRAIN, start, end)
+    print(f"\nGenerating training set (target {n_train:,} events)...")
+    train_events = build_normal_dataset(sampler, users, n_train, start, end)
     print(f"  Generated {len(train_events):,} events")
 
     if not args.train_only:
-        print(f"\nGenerating validation set (target {N_VAL:,} events)...")
-        val_events = build_normal_dataset(sampler, users, N_VAL, start, end)
+        print(f"\nGenerating validation set (target {n_val:,} events)...")
+        val_events = build_normal_dataset(sampler, users, n_val, start, end)
         print(f"  Generated {len(val_events):,} events")
 
-        print(f"\nGenerating anomaly test set ({N_ANOMALY_TEST:,} events)...")
+        print(f"\nGenerating anomaly test set ({n_test:,} events)...")
         test_events = build_anomaly_test_dataset(
-            sampler, injector, users, N_ANOMALY_TEST, start, end
+            sampler, injector, users, n_test, start, end
         )
         n_anomalous = sum(1 for e in test_events if "_anomaly" in e)
         print(f"  Anomalous events: {n_anomalous} / {len(test_events)}")
 
     print("\nWriting JSONL files...")
-    write_jsonl(train_events, OUT_DIR / "train.jsonl")
+    write_jsonl(train_events, out_dir / "train.jsonl")
 
     if not args.train_only:
-        write_jsonl(val_events,  OUT_DIR / "val.jsonl")
-        write_jsonl(test_events, OUT_DIR / "anomaly_test.jsonl")
+        write_jsonl(val_events,  out_dir / "val.jsonl")
+        write_jsonl(test_events, out_dir / "anomaly_test.jsonl")
 
         print("\nAnomaly breakdown in test set:")
         counts = Counter(
@@ -952,7 +984,7 @@ def main():
         for atype, count in sorted(counts.items()):
             print(f"  {atype:<25} {count:>4} events")
 
-    print("\nDone. Data ready in data/")
+    print("\nDone. Data ready in", out_dir)
 
 
 if __name__ == "__main__":
