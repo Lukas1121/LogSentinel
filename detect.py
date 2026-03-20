@@ -270,19 +270,14 @@ def pr_curve(scores, labels, n_points=40):
 
 # ── Load scores ───────────────────────────────────────────────────────────────
 
-def load_saved_scores():
-    """Load pre-computed scores from results/anomaly_scores.json."""
-    path = RES_DIR / "anomaly_scores.json"
+def load_saved_scores(path: Path = RES_DIR / "anomaly_scores.json"):
     if not path.exists():
-        raise FileNotFoundError(
-            f"{path} not found. Run train_transformer.py first, "
-            "or use --recompute to load from checkpoint."
-        )
+        raise FileNotFoundError(...)
     data = json.loads(path.read_text())
-    scores = torch.tensor(data["test_scores"], dtype=torch.float32)
-    labels = torch.tensor(data["test_labels"], dtype=torch.bool)
-    val_mean = data["val_score_mean"]
-    val_std  = data["val_score_std"]
+    scores  = torch.tensor(data["test_scores"], dtype=torch.float32)
+    labels  = torch.tensor(data["test_labels"], dtype=torch.bool)
+    val_mean = data.get("val_score_mean") or data.get("val_mean", 0.0)
+    val_std  = data.get("val_score_std")  or data.get("val_std",  1.0)
     print(f"  Loaded {len(scores)} test windows  "
           f"({labels.sum().item()} anomalous)  from {path}")
     return scores, labels, val_mean, val_std
@@ -403,6 +398,19 @@ def main():
         "--sweep-sigmas", type=str, default=None,
         help="Comma-separated sigma values for custom sweep (e.g. '2.0,2.5,3.0')"
     )
+    parser.add_argument(
+    "--checkpoint", type=str, default=None,
+    help="Path to a specific model checkpoint. "
+         "Overrides the default checkpoints/model_best.pt. "
+         "Use with --recompute to evaluate a fine-tuned model. "
+         "Example: --checkpoint data/tenant_test/finetuned/model_finetuned.pt"
+    )
+    parser.add_argument(
+        "--scores-file", type=str, default=None,
+        help="Path to a specific anomaly_scores.json to load. "
+            "Overrides the default results/anomaly_scores.json. "
+            "Example: --scores-file data/tenant_test/finetuned/anomaly_scores.json"
+    )
     args = parser.parse_args()
 
     print("\n  LogSentinel — detect.py")
@@ -411,6 +419,9 @@ def main():
     if args.recompute:
         print("  Mode: recompute from checkpoint")
         scores, labels, val_mean, val_std = recompute_scores()
+    elif args.scores_file:
+        print(f"  Mode: load from {args.scores_file}")
+        scores, labels, val_mean, val_std = load_saved_scores(Path(args.scores_file))
     else:
         print("  Mode: load from results/anomaly_scores.json")
         scores, labels, val_mean, val_std = load_saved_scores()
