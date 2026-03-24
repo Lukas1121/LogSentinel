@@ -282,11 +282,21 @@ def main():
     combined_flags = [m or r for m, r in zip(model_flags, rule_flags)]
     m_combined     = metrics(combined_flags, labels)
 
-    # ── FP suppression (model-only flags only) ────────────────────────────────
+    # ── Combined complement: rules only fill gaps the model completely misses ──
+    # If the model already flags at least one window for a user they are already
+    # under investigation — no need for rules to also flag all their normal windows.
+    model_flagged_users = {user_ids[i] for i, f in enumerate(model_flags) if f}
+    gap_rule_users      = all_rule_users - model_flagged_users
+    gap_rule_flags      = [uid in gap_rule_users for uid in user_ids]
+    combined_gap_flags  = [m or r for m, r in zip(model_flags, gap_rule_flags)]
+    m_combined_gap      = metrics(combined_gap_flags, labels)
+    print(f"    rules filling model gaps: {len(gap_rule_users):2d} users  — {sorted(gap_rule_users)}")
+
+    # ── FP suppression on gap-combined flags ──────────────────────────────────
     after_marginal, n_marginal = suppress_marginal(
-        combined_flags, scores, threshold, rule_flags, args.marginal_pct)
+        combined_gap_flags, scores, threshold, gap_rule_flags, args.marginal_pct)
     after_storm, n_storm = suppress_storm(
-        after_marginal, scores, user_ids, rule_flags, args.storm_limit)
+        after_marginal, scores, user_ids, gap_rule_flags, args.storm_limit)
     m_final = metrics(after_storm, labels)
 
     # ── Report ────────────────────────────────────────────────────────────────
@@ -295,14 +305,15 @@ def main():
     print(f"  {'Stage':<42} {'TP':>4}  {'FP':>5}  {'FN':>4}  "
           f"{'P':>6}  {'R':>6}  {'F1':>6}  {'Flagged':>7}")
     print(f"{'─' * W}")
-    print_metrics("1. Model only",               m_model)
-    print_metrics("2. Rules only",               m_rules)
-    print_metrics("3. Combined (model OR rules)", m_combined)
-    print_metrics("4. Combined + FP suppression", m_final)
+    print_metrics("1. Model only",                        m_model)
+    print_metrics("2. Rules only",                        m_rules)
+    print_metrics("3. Combined (model OR all rules)",     m_combined)
+    print_metrics("4. Combined (model + gap rules)",      m_combined_gap)
+    print_metrics("5. Combined gap + FP suppression",     m_final)
     print(f"{'─' * W}")
 
-    print(f"\n  FP suppression removed: {n_marginal} marginal + {n_storm} storm "
-          f"= {n_marginal + n_storm} total")
+    print(f"\n  Gap rules cover:   {len(gap_rule_users)} users (model misses entirely)")
+    print(f"  FP suppression:    {n_marginal} marginal + {n_storm} storm = {n_marginal + n_storm} removed")
     print(f"  Missed anomalies (final): {m_final['fn']}")
     if m_final["tp"] > 0:
         print(f"  FP per TP (final):        {m_final['fp'] / m_final['tp']:.2f}")
@@ -326,10 +337,11 @@ def main():
             "brute_force":   sorted(bf_users),
         },
         "metrics": {
-            "model_only":   m_model,
-            "rules_only":   m_rules,
-            "combined":     m_combined,
-            "final":        m_final,
+            "model_only":      m_model,
+            "rules_only":      m_rules,
+            "combined_all":    m_combined,
+            "combined_gap":    m_combined_gap,
+            "final":           m_final,
         },
     }
 
