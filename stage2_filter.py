@@ -39,8 +39,8 @@ from pathlib import Path
 DEFAULT_SCORES_FILE          = "data/tenant_test/finetuned/anomaly_scores.json"
 DEFAULT_EVENTS_FILE          = "data/tenant_test/anomaly_test.jsonl"
 DEFAULT_SIGMA                = 2.0
-DEFAULT_MARGINAL_PCT         = 0.10
-DEFAULT_STORM_LIMIT          = 5
+DEFAULT_MARGINAL_PCT         = 0.0   # suppression costs TPs — disabled by default
+DEFAULT_STORM_LIMIT          = 999   # suppression costs TPs — disabled by default
 DEFAULT_MASS_DL_THRESHOLD    = 8
 DEFAULT_MASS_DL_WINDOW_S     = 300
 DEFAULT_BRUTE_THRESHOLD      = 10
