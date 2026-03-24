@@ -1,50 +1,46 @@
 """
 stage2_filter.py
-Hybrid detection stage for LogSentinel.
+Burst download detection for LogSentinel.
 
-Combines BitNet transformer perplexity (Stage 1) with a rule-based engine
-to catch volume/rate anomalies that perplexity alone misses when anomalous
-events are diluted within a large context window.
+Scans raw M365 audit log events per user for download bursts — a high
+number of file download events within a short rolling time window.
 
-Rules (ADD flags):
-  Rule A — mass_download  : ≥8 FileDownloaded events from same user in 5 min
-  Rule B — brute_force    : ≥10 UserLoginFailed from same IP in 60 seconds
+Works directly on raw JSONL events. No transformer, no windows, no model
+scores required. Each user's event stream is scanned independently.
 
-FP suppression (applied to model-only flags, never rule flags):
-  Suppression 1 — Marginal score : score < threshold + 10% → suppress
-  Suppression 2 — Alert storm    : user has >5 model flags → keep only highest
+A burst is defined as: >= THRESHOLD download events from the same user
+within any WINDOW_MINUTES minute interval. All download events within
+that interval are flagged and reported.
+
+Multi-platform aware: counts downloads across SharePoint, OneDrive, and
+any other workload. Each flagged event records its source platform.
 
 Usage:
-    # Default — finetuned model results
     python stage2_filter.py
-
-    # Custom paths / sigma
-    python stage2_filter.py \\
-        --scores-file data/tenant_test/finetuned/anomaly_scores.json \\
-        --events-file data/tenant_test/anomaly_test.jsonl \\
-        --sigma 2.0
-
-    # Tune rule sensitivity
-    python stage2_filter.py --mass-download-threshold 6 --brute-force-threshold 8
+    python stage2_filter.py --events-file data/tenant_test/anomaly_test.jsonl
+    python stage2_filter.py --window-minutes 10 --threshold 15
+    python stage2_filter.py --events-file data/tenant_real/logs.jsonl --out alerts.json
 """
 
 import argparse
-import hashlib
 import json
 from collections import defaultdict
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+# ── Download operations to monitor ────────────────────────────────────────────
+# Add any M365 operation name that represents a file download.
+DOWNLOAD_OPS = {
+    "FileDownloaded",
+    "FileSyncDownloadedFull",
+    "FileSyncDownloadedPartial",
+    "FileAccessed",          # broad — remove if too noisy for your tenant
+}
+
 # ── Defaults ───────────────────────────────────────────────────────────────────
-DEFAULT_SCORES_FILE          = "data/tenant_test/finetuned/anomaly_scores.json"
-DEFAULT_EVENTS_FILE          = "data/tenant_test/anomaly_test.jsonl"
-DEFAULT_SIGMA                = 2.0
-DEFAULT_MARGINAL_PCT         = 0.0   # suppression costs TPs — disabled by default
-DEFAULT_STORM_LIMIT          = 999   # suppression costs TPs — disabled by default
-DEFAULT_MASS_DL_THRESHOLD    = 8
-DEFAULT_MASS_DL_WINDOW_S     = 300
-DEFAULT_BRUTE_THRESHOLD      = 10
-DEFAULT_BRUTE_WINDOW_S       = 60
+DEFAULT_EVENTS_FILE    = "data/tenant_test/anomaly_test.jsonl"
+DEFAULT_WINDOW_MINUTES = 5
+DEFAULT_THRESHOLD      = 8
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
@@ -54,301 +50,200 @@ def load_jsonl(path: Path) -> list[dict]:
         return [json.loads(l) for l in f if l.strip()]
 
 
-def uid_hash(email: str) -> str:
-    return hashlib.md5(email.encode()).hexdigest()[:4]
-
-
 def parse_time(ts: str) -> datetime:
     return datetime.fromisoformat(ts.replace("Z", "+00:00"))
 
 
-def metrics(predicted: list[bool], labels: list[bool]) -> dict:
-    tp = sum(p and l for p, l in zip(predicted, labels))
-    fp = sum(p and not l for p, l in zip(predicted, labels))
-    fn = sum(not p and l for p, l in zip(predicted, labels))
-    precision = tp / max(tp + fp, 1)
-    recall    = tp / max(tp + fn, 1)
-    f1        = 2 * precision * recall / max(precision + recall, 1e-8)
-    return {
-        "tp": tp, "fp": fp, "fn": fn,
-        "precision": round(precision, 4),
-        "recall":    round(recall, 4),
-        "f1":        round(f1, 4),
-        "flagged":   sum(predicted),
-    }
+# ── Burst detection ────────────────────────────────────────────────────────────
 
-
-def print_metrics(label: str, m: dict):
-    print(f"  {label:<42} "
-          f"TP={m['tp']:3d}  FP={m['fp']:4d}  FN={m['fn']:3d}  "
-          f"P={m['precision']:.3f}  R={m['recall']:.3f}  "
-          f"F1={m['f1']:.3f}  Flagged={m['flagged']}")
-
-
-# ── Rule engine ────────────────────────────────────────────────────────────────
-
-def rule_mass_download(events: list[dict], threshold: int, window_s: int) -> set[str]:
+def detect_bursts(
+    events: list[dict],
+    window_minutes: int,
+    threshold: int,
+) -> list[dict]:
     """
-    Flag user hashes where ≥threshold FileDownloaded events occur within
-    window_s seconds of each other.
+    Scan all events for per-user download bursts.
+
+    For each user, collect their download events sorted by time.
+    Slide a window of `window_minutes` minutes: if any window contains
+    >= threshold events, all events in that window are flagged as a burst.
+
+    Overlapping bursts are merged — once a burst starts, all download events
+    within window_minutes of the first event are included before looking
+    for the next independent burst.
+
+    Returns a list of burst dicts, each containing:
+        user_id       : user who triggered the burst
+        burst_start   : timestamp of first download in burst
+        burst_end     : timestamp of last download in burst
+        event_count   : number of download events in burst
+        platforms     : set of workloads (SharePoint, OneDrive, ...)
+        events        : list of the raw event dicts in the burst
+        is_true_positive : True if any event has _anomaly label (eval only)
     """
-    user_times: dict[str, list[datetime]] = defaultdict(list)
+    window = timedelta(minutes=window_minutes)
+
+    # Group download events by user
+    user_downloads: dict[str, list[dict]] = defaultdict(list)
     for e in events:
-        if e.get("Operation") == "FileDownloaded":
-            uid = e.get("UserId", "")
-            try:
-                user_times[uid].append(parse_time(e["CreationTime"]))
-            except (KeyError, ValueError):
-                pass
+        if e.get("Operation") in DOWNLOAD_OPS:
+            user_downloads[e.get("UserId", "unknown")].append(e)
 
-    triggered: set[str] = set()
-    for uid, times in user_times.items():
-        times.sort()
-        for i, t0 in enumerate(times):
-            count = sum(
-                1 for t in times[i:]
-                if (t - t0).total_seconds() <= window_s
-            )
-            if count >= threshold:
-                triggered.add(uid_hash(uid))
-                break
-    return triggered
+    bursts = []
 
+    for user_id, dl_events in user_downloads.items():
+        # Sort by time
+        try:
+            dl_events.sort(key=lambda e: parse_time(e["CreationTime"]))
+        except (KeyError, ValueError):
+            continue
 
-def rule_brute_force(events: list[dict], threshold: int, window_s: int) -> set[str]:
-    """
-    Flag user hashes where ≥threshold UserLoginFailed events from the same IP
-    occur within window_s seconds of each other.
-    """
-    ip_entries: dict[str, list[tuple[datetime, str]]] = defaultdict(list)
-    for e in events:
-        if e.get("Operation") == "UserLoginFailed":
-            ip  = e.get("ClientIP", "unknown")
-            uid = e.get("UserId", "")
-            try:
-                ip_entries[ip].append((parse_time(e["CreationTime"]), uid))
-            except (KeyError, ValueError):
-                pass
+        i = 0
+        while i < len(dl_events):
+            anchor_time = parse_time(dl_events[i]["CreationTime"])
+            window_end  = anchor_time + window
 
-    triggered: set[str] = set()
-    for ip, entries in ip_entries.items():
-        entries.sort()
-        for i, (t0, _) in enumerate(entries):
-            window = [
-                (t, u) for t, u in entries[i:]
-                if (t - t0).total_seconds() <= window_s
+            # Collect all events within window_minutes of anchor
+            burst_events = [
+                e for e in dl_events[i:]
+                if parse_time(e["CreationTime"]) <= window_end
             ]
-            if len(window) >= threshold:
-                for _, uid in window:
-                    triggered.add(uid_hash(uid))
-                break
-    return triggered
 
+            if len(burst_events) >= threshold:
+                platforms = {e.get("Workload", "Unknown") for e in burst_events}
+                is_tp     = any("_anomaly" in e for e in burst_events)
+                bursts.append({
+                    "user_id":          user_id,
+                    "burst_start":      dl_events[i]["CreationTime"],
+                    "burst_end":        burst_events[-1]["CreationTime"],
+                    "event_count":      len(burst_events),
+                    "platforms":        sorted(platforms),
+                    "is_true_positive": is_tp,
+                    "events":           burst_events,
+                })
+                # Skip past this burst before looking for the next one
+                i += len(burst_events)
+            else:
+                i += 1
 
-# ── FP suppression ─────────────────────────────────────────────────────────────
-
-def suppress_marginal(
-    flags: list[bool],
-    scores: list[float],
-    threshold: float,
-    rule_flags: list[bool],
-    pct: float,
-) -> tuple[list[bool], int]:
-    """Suppress model flags with scores barely above threshold. Never suppresses rule flags."""
-    out = list(flags)
-    suppressed = 0
-    for i, flagged in enumerate(out):
-        if flagged and not rule_flags[i] and scores[i] < threshold * (1 + pct):
-            out[i] = False
-            suppressed += 1
-    return out, suppressed
-
-
-def suppress_storm(
-    flags: list[bool],
-    scores: list[float],
-    user_ids: list[str],
-    rule_flags: list[bool],
-    limit: int,
-) -> tuple[list[bool], int]:
-    """
-    For users with >limit model-only flags, keep only the highest-scoring window.
-    Never suppresses rule-flagged windows.
-    """
-    user_model_indices: dict[str, list[int]] = defaultdict(list)
-    for i, flagged in enumerate(flags):
-        if flagged and not rule_flags[i]:
-            user_model_indices[user_ids[i]].append(i)
-
-    out = list(flags)
-    suppressed = 0
-    for uid, indices in user_model_indices.items():
-        if len(indices) > limit:
-            best = max(indices, key=lambda i: scores[i])
-            for i in indices:
-                if i != best:
-                    out[i] = False
-                    suppressed += 1
-    return out, suppressed
+    # Sort output by time
+    bursts.sort(key=lambda b: b["burst_start"])
+    return bursts
 
 
 # ── Main ───────────────────────────────────────────────────────────────────────
 
 def main():
     parser = argparse.ArgumentParser(
-        description="LogSentinel Stage 2 — Hybrid Detection"
+        description="LogSentinel Stage 2 — Burst Download Detection"
     )
-    parser.add_argument("--scores-file",
-                        default=DEFAULT_SCORES_FILE,
-                        help="Path to anomaly_scores.json from finetune.py or detect.py")
-    parser.add_argument("--events-file",
-                        default=DEFAULT_EVENTS_FILE,
-                        help="Path to raw test events JSONL")
-    parser.add_argument("--sigma",
-                        type=float, default=DEFAULT_SIGMA,
-                        help="Model threshold = val_mean + sigma * val_std")
-    parser.add_argument("--marginal-pct",
-                        type=float, default=DEFAULT_MARGINAL_PCT,
-                        help="Suppress model flags within this %% above threshold")
-    parser.add_argument("--storm-limit",
-                        type=int, default=DEFAULT_STORM_LIMIT,
-                        help="Max model flags per user before storm suppression")
-    parser.add_argument("--mass-download-threshold",
-                        type=int, default=DEFAULT_MASS_DL_THRESHOLD,
-                        help="Min FileDownloaded events to trigger mass_download rule")
-    parser.add_argument("--mass-download-window",
-                        type=int, default=DEFAULT_MASS_DL_WINDOW_S,
-                        help="Time window in seconds for mass_download rule")
-    parser.add_argument("--brute-force-threshold",
-                        type=int, default=DEFAULT_BRUTE_THRESHOLD,
-                        help="Min failed logins from same IP to trigger brute_force rule")
-    parser.add_argument("--brute-force-window",
-                        type=int, default=DEFAULT_BRUTE_WINDOW_S,
-                        help="Time window in seconds for brute_force rule")
+    parser.add_argument(
+        "--events-file", default=DEFAULT_EVENTS_FILE,
+        help="Path to raw events JSONL file",
+    )
+    parser.add_argument(
+        "--window-minutes", type=int, default=DEFAULT_WINDOW_MINUTES,
+        help=f"Rolling time window in minutes (default: {DEFAULT_WINDOW_MINUTES})",
+    )
+    parser.add_argument(
+        "--threshold", type=int, default=DEFAULT_THRESHOLD,
+        help=f"Min download events in window to trigger alert (default: {DEFAULT_THRESHOLD})",
+    )
+    parser.add_argument(
+        "--out", default=None,
+        help="Output JSON file for alerts (default: <events_dir>/burst_alerts.json)",
+    )
     args = parser.parse_args()
 
-    scores_path = Path(args.scores_file)
     events_path = Path(args.events_file)
-    out_dir     = scores_path.parent
+    out_path    = Path(args.out) if args.out else events_path.parent / "burst_alerts.json"
 
-    print("=" * 74)
-    print("  LogSentinel Stage 2 — Hybrid Detection")
-    print("=" * 74)
-    print(f"\n  Scores:  {scores_path}")
-    print(f"  Events:  {events_path}")
-    print(f"  Sigma:   {args.sigma}")
+    print("=" * 66)
+    print("  LogSentinel Stage 2 — Burst Download Detection")
+    print("=" * 66)
+    print(f"\n  Events:         {events_path}")
+    print(f"  Window:         {args.window_minutes} minutes")
+    print(f"  Threshold:      >= {args.threshold} downloads in window")
+    print(f"  Monitored ops:  {sorted(DOWNLOAD_OPS)}")
 
-    # ── Load ──────────────────────────────────────────────────────────────────
-    stage1   = json.loads(scores_path.read_text())
-    scores   = stage1["test_scores"]
-    labels   = [bool(l) for l in stage1["test_labels"]]
-    user_ids = stage1["test_user_ids"]
+    events = load_jsonl(events_path)
+    print(f"\n  Loaded {len(events):,} events")
 
-    val_mean = stage1.get("val_mean")
-    val_std  = stage1.get("val_std")
-    if val_mean is None or val_std is None:
-        raise ValueError(
-            "anomaly_scores.json is missing val_mean/val_std. "
-            "Re-run finetune.py to regenerate."
-        )
+    # Count users and download events
+    n_users     = len({e.get("UserId") for e in events})
+    n_downloads = sum(1 for e in events if e.get("Operation") in DOWNLOAD_OPS)
+    print(f"  Users:          {n_users}")
+    print(f"  Download events:{n_downloads:,}")
 
-    threshold = val_mean + args.sigma * val_std
-    events    = load_jsonl(events_path)
-
-    print(f"\n  Windows:          {len(scores):,}")
-    print(f"  Anomalous:        {sum(labels)}")
-    print(f"  Val distribution: mean={val_mean:.2f}  std={val_std:.2f}")
-    print(f"  Threshold:        {threshold:.2f}  (sigma={args.sigma})")
-
-    # ── Stage 1: model flags ──────────────────────────────────────────────────
-    model_flags = [s > threshold for s in scores]
-    m_model     = metrics(model_flags, labels)
-
-    # ── Rule engine ───────────────────────────────────────────────────────────
-    print("\n  Running rule engine on raw events...")
-    md_users  = rule_mass_download(
-        events, args.mass_download_threshold, args.mass_download_window)
-    bf_users  = rule_brute_force(
-        events, args.brute_force_threshold, args.brute_force_window)
-
-    all_rule_users = md_users | bf_users
-    print(f"    mass_download triggered: {len(md_users):2d} users  — {sorted(md_users)}")
-    print(f"    brute_force   triggered: {len(bf_users):2d} users  — {sorted(bf_users)}")
-
-    rule_flags = [uid in all_rule_users for uid in user_ids]
-    m_rules    = metrics(rule_flags, labels)
-
-    # ── Combined (model OR rules) ──────────────────────────────────────────────
-    combined_flags = [m or r for m, r in zip(model_flags, rule_flags)]
-    m_combined     = metrics(combined_flags, labels)
-
-    # ── Combined complement: rules only fill gaps the model completely misses ──
-    # If the model already flags at least one window for a user they are already
-    # under investigation — no need for rules to also flag all their normal windows.
-    model_flagged_users = {user_ids[i] for i, f in enumerate(model_flags) if f}
-    gap_rule_users      = all_rule_users - model_flagged_users
-    gap_rule_flags      = [uid in gap_rule_users for uid in user_ids]
-    combined_gap_flags  = [m or r for m, r in zip(model_flags, gap_rule_flags)]
-    m_combined_gap      = metrics(combined_gap_flags, labels)
-    print(f"    rules filling model gaps: {len(gap_rule_users):2d} users  — {sorted(gap_rule_users)}")
-
-    # ── FP suppression on gap-combined flags ──────────────────────────────────
-    after_marginal, n_marginal = suppress_marginal(
-        combined_gap_flags, scores, threshold, gap_rule_flags, args.marginal_pct)
-    after_storm, n_storm = suppress_storm(
-        after_marginal, scores, user_ids, gap_rule_flags, args.storm_limit)
-    m_final = metrics(after_storm, labels)
+    # Detect bursts
+    bursts = detect_bursts(events, args.window_minutes, args.threshold)
 
     # ── Report ────────────────────────────────────────────────────────────────
-    W = 74
-    print(f"\n{'─' * W}")
-    print(f"  {'Stage':<42} {'TP':>4}  {'FP':>5}  {'FN':>4}  "
-          f"{'P':>6}  {'R':>6}  {'F1':>6}  {'Flagged':>7}")
-    print(f"{'─' * W}")
-    print_metrics("1. Model only",                        m_model)
-    print_metrics("2. Rules only",                        m_rules)
-    print_metrics("3. Combined (model OR all rules)",     m_combined)
-    print_metrics("4. Combined (model + gap rules)",      m_combined_gap)
-    print_metrics("5. Combined gap + FP suppression",     m_final)
-    print(f"{'─' * W}")
+    print(f"\n{'─' * 66}")
+    print(f"  Burst alerts detected: {len(bursts)}")
+    print(f"{'─' * 66}")
 
-    print(f"\n  Gap rules cover:   {len(gap_rule_users)} users (model misses entirely)")
-    print(f"  FP suppression:    {n_marginal} marginal + {n_storm} storm = {n_marginal + n_storm} removed")
-    print(f"  Missed anomalies (final): {m_final['fn']}")
-    if m_final["tp"] > 0:
-        print(f"  FP per TP (final):        {m_final['fp'] / m_final['tp']:.2f}")
+    if not bursts:
+        print("  No bursts detected.")
+    else:
+        for b in bursts:
+            tp_marker = " [LABELED ANOMALY]" if b["is_true_positive"] else ""
+            print(f"\n  User:     {b['user_id']}{tp_marker}")
+            print(f"  Start:    {b['burst_start']}")
+            print(f"  End:      {b['burst_end']}")
+            print(f"  Events:   {b['event_count']} downloads")
+            print(f"  Platform: {', '.join(b['platforms'])}")
+
+    # ── Evaluation summary (only if _anomaly labels present) ──────────────────
+    has_labels = any("_anomaly" in e for e in events)
+    if has_labels:
+        true_bursts  = sum(1 for b in bursts if b["is_true_positive"])
+        false_bursts = sum(1 for b in bursts if not b["is_true_positive"])
+
+        # Count labeled mass_download users in events
+        labeled_md_users = {
+            e.get("UserId") for e in events
+            if e.get("_anomaly", {}).get("type") == "mass_download"
+        }
+        detected_md_users = {
+            b["user_id"] for b in bursts if b["is_true_positive"]
+        }
+        missed_md_users = labeled_md_users - detected_md_users
+
+        print(f"\n{'─' * 66}")
+        print(f"  Evaluation (ground truth labels present)")
+        print(f"{'─' * 66}")
+        print(f"  Labeled mass_download users:   {len(labeled_md_users)}")
+        print(f"  Detected (true positives):     {true_bursts} bursts "
+              f"across {len(detected_md_users)} users")
+        print(f"  False positives:               {false_bursts} bursts")
+        print(f"  Missed users:                  {len(missed_md_users)} "
+              f"— {sorted(missed_md_users) or 'none'}")
+        if labeled_md_users:
+            recall = len(detected_md_users) / len(labeled_md_users)
+            print(f"  User-level recall:             {recall:.3f}")
 
     # ── Save ──────────────────────────────────────────────────────────────────
-    results = {
+    output = {
         "config": {
-            "sigma":                    args.sigma,
-            "threshold":                round(threshold, 4),
-            "val_mean":                 val_mean,
-            "val_std":                  val_std,
-            "mass_download_threshold":  args.mass_download_threshold,
-            "mass_download_window_s":   args.mass_download_window,
-            "brute_force_threshold":    args.brute_force_threshold,
-            "brute_force_window_s":     args.brute_force_window,
-            "marginal_pct":             args.marginal_pct,
-            "storm_limit":              args.storm_limit,
+            "events_file":    str(events_path),
+            "window_minutes": args.window_minutes,
+            "threshold":      args.threshold,
+            "download_ops":   sorted(DOWNLOAD_OPS),
         },
-        "rule_triggered_users": {
-            "mass_download": sorted(md_users),
-            "brute_force":   sorted(bf_users),
+        "summary": {
+            "total_events":   len(events),
+            "total_bursts":   len(bursts),
+            "users_flagged":  len({b["user_id"] for b in bursts}),
         },
-        "metrics": {
-            "model_only":      m_model,
-            "rules_only":      m_rules,
-            "combined_all":    m_combined,
-            "combined_gap":    m_combined_gap,
-            "final":           m_final,
-        },
+        "bursts": [
+            {k: v for k, v in b.items() if k != "events"}
+            for b in bursts
+        ],
     }
-
-    out_path = out_dir / "stage2_results.json"
-    out_path.write_text(json.dumps(results, indent=2))
-    print(f"\n  Results saved → {out_path}")
-    print("=" * 74)
+    out_path.write_text(json.dumps(output, indent=2))
+    print(f"\n  Alerts saved → {out_path}")
+    print("=" * 66)
 
 
 if __name__ == "__main__":
