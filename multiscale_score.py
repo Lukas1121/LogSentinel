@@ -334,7 +334,8 @@ def main():
     ckpt_path = finetuned_dir / "model_finetuned.pt"
     ckpt      = torch.load(ckpt_path, map_location=device, weights_only=True)
     cfg       = ckpt["config"]
-    vocab_size = ckpt["vocab_size"]
+    # Use actual embedding shape from state_dict — avoids padded vs real vocab confusion
+    vocab_size = ckpt["model_state"]["token_emb.weight"].shape[0]
 
     model = BitNetTransformer(
         vocab=vocab_size, emb_dim=cfg["emb_dim"],
