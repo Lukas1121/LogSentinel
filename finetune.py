@@ -598,6 +598,8 @@ def main():
     parser.add_argument("--freeze-epochs",type=int,   default=FREEZE_EPOCHS)
     parser.add_argument("--n-sigma",      type=float, default=N_SIGMA)
     parser.add_argument("--min-windows",  type=int,   default=10)
+    parser.add_argument("--resume",       action="store_true",
+                        help="Resume from existing model_finetuned.pt — skips Phase 1")
     args = parser.parse_args()
 
     tenant_dir = Path(args.tenant_dir)
@@ -650,20 +652,43 @@ def main():
     vocab.save(out_dir / "tokeniser_tenant.json")
 
     # ── Load and expand base model ────────────────────────────────────────────
-    print(f"\nLoading base model from {args.base_ckpt}...")
-    ckpt = torch.load(args.base_ckpt, map_location=device, weights_only=True)
-    cfg  = ckpt["config"]
-    print(f"  Base: vocab={cfg['vocab']} emb={cfg['emb_dim']} "
-          f"layers={cfg['n_layers']} heads={cfg['n_heads']}")
-
-    model = BitNetTransformer(
-        vocab=cfg["vocab"], emb_dim=cfg["emb_dim"],
-        n_layers=cfg["n_layers"], n_heads=cfg["n_heads"],
-        ctx_len=cfg["ctx_len"],
-    ).to(device)
-    model.load_state_dict(ckpt["model_state"])
-    model.expand_vocab(vocab.size, cfg["emb_dim"])
-    model = model.to(device)
+    if args.resume:
+        resume_path = out_dir / "model_finetuned.pt"
+        if not resume_path.exists():
+            raise FileNotFoundError(
+                f"--resume specified but {resume_path} not found. "
+                "Run without --resume first."
+            )
+        print(f"\nResuming from {resume_path}...")
+        ckpt = torch.load(resume_path, map_location=device, weights_only=True)
+        cfg  = ckpt["config"]
+        resumed_epoch    = ckpt.get("epoch", 0)
+        resumed_val_loss = ckpt.get("val_loss", float("inf"))
+        print(f"  Checkpoint: epoch={resumed_epoch}  val_loss={resumed_val_loss:.4f}")
+        print(f"  Model: vocab={ckpt['vocab_size']} emb={cfg['emb_dim']} "
+              f"layers={cfg['n_layers']} heads={cfg['n_heads']}")
+        model = BitNetTransformer(
+            vocab=ckpt["vocab_size"], emb_dim=cfg["emb_dim"],
+            n_layers=cfg["n_layers"], n_heads=cfg["n_heads"],
+            ctx_len=cfg["ctx_len"],
+        ).to(device)
+        model.load_state_dict(ckpt["model_state"])
+    else:
+        print(f"\nLoading base model from {args.base_ckpt}...")
+        ckpt = torch.load(args.base_ckpt, map_location=device, weights_only=True)
+        cfg  = ckpt["config"]
+        resumed_epoch    = 0
+        resumed_val_loss = float("inf")
+        print(f"  Base: vocab={cfg['vocab']} emb={cfg['emb_dim']} "
+              f"layers={cfg['n_layers']} heads={cfg['n_heads']}")
+        model = BitNetTransformer(
+            vocab=cfg["vocab"], emb_dim=cfg["emb_dim"],
+            n_layers=cfg["n_layers"], n_heads=cfg["n_heads"],
+            ctx_len=cfg["ctx_len"],
+        ).to(device)
+        model.load_state_dict(ckpt["model_state"])
+        model.expand_vocab(vocab.size, cfg["emb_dim"])
+        model = model.to(device)
 
     # ── Pack windows ──────────────────────────────────────────────────────────
     print("\nPacking training windows...")
@@ -682,8 +707,13 @@ def main():
                               batch_size=BATCH_SIZE, shuffle=False, num_workers=0)
 
     # ── Training ──────────────────────────────────────────────────────────────
-    log               = []
-    best_val_loss     = float("inf")
+    log_path = out_dir / "finetune_log.json"
+    if args.resume and log_path.exists():
+        log = json.loads(log_path.read_text())
+        print(f"\n  Loaded existing training log ({len(log)} epochs).")
+    else:
+        log = []
+    best_val_loss     = resumed_val_loss
     epochs_no_improve = 0
     best_ckpt_path    = out_dir / "model_finetuned.pt"
 
@@ -697,11 +727,16 @@ def main():
         }, best_ckpt_path)
 
     # ── Phase 1: frozen — only user embeddings update ─────────────────────────
-    print(f"\n{'='*60}")
-    print(f"  Phase 1 -- Frozen ({args.freeze_epochs} epochs, LR={LR_FROZEN:.0e})")
-    print(f"  Only new user token rows update.")
-    print(f"  Base model knowledge is fully preserved.")
-    print(f"{'='*60}\n")
+    if args.resume:
+        print(f"\n  Skipping Phase 1 (resume — user embeddings already trained).")
+        args.freeze_epochs = 0
+
+    if not args.resume:
+        print(f"\n{'='*60}")
+        print(f"  Phase 1 -- Frozen ({args.freeze_epochs} epochs, LR={LR_FROZEN:.0e})")
+        print(f"  Only new user token rows update.")
+        print(f"  Base model knowledge is fully preserved.")
+        print(f"{'='*60}\n")
 
     for param in model.parameters():
         param.requires_grad = False
