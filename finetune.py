@@ -664,11 +664,12 @@ def main():
         cfg  = ckpt["config"]
         resumed_epoch    = ckpt.get("epoch", 0)
         resumed_val_loss = ckpt.get("val_loss", float("inf"))
+        actual_vocab = ckpt["model_state"]["token_emb.weight"].shape[0]
         print(f"  Checkpoint: epoch={resumed_epoch}  val_loss={resumed_val_loss:.4f}")
-        print(f"  Model: vocab={ckpt['vocab_size']} emb={cfg['emb_dim']} "
+        print(f"  Model: vocab={actual_vocab} emb={cfg['emb_dim']} "
               f"layers={cfg['n_layers']} heads={cfg['n_heads']}")
         model = BitNetTransformer(
-            vocab=ckpt["vocab_size"], emb_dim=cfg["emb_dim"],
+            vocab=actual_vocab, emb_dim=cfg["emb_dim"],
             n_layers=cfg["n_layers"], n_heads=cfg["n_heads"],
             ctx_len=cfg["ctx_len"],
         ).to(device)
