@@ -1,298 +1,342 @@
 """
 stage2_filter.py
-Rule-based false positive filter for LogSentinel Stage 2.
+Hybrid detection stage for LogSentinel.
 
-Takes Stage 1 (BitNet transformer) flagged windows and applies four
-structural rules to suppress obvious false positives before passing
-remaining alerts to Stage 3 (neural classifier).
+Combines BitNet transformer perplexity (Stage 1) with a rule-based engine
+to catch volume/rate anomalies that perplexity alone misses when anomalous
+events are diluted within a large context window.
 
-Rules applied in order:
-  Rule 1 — Padding ratio     : window > 50% PAD tokens → suppress
-  Rule 2 — Marginal score    : score < 10% above user threshold → suppress
-  Rule 3 — Alert storm       : user has > 5 flags → keep only highest
-  Rule 4 — Operation frequency: dominant op in user's top-3 history → suppress
+Rules (ADD flags):
+  Rule A — mass_download  : ≥8 FileDownloaded events from same user in 5 min
+  Rule B — brute_force    : ≥10 UserLoginFailed from same IP in 60 seconds
 
-Input:
-  data/test_tokens.pt         stage 1 windows
-  data/test_labels.pt         ground truth labels
-  data/test_user_ids.json     user ID per window
-  data/tokeniser.json         vocab (to decode PAD token ID)
-  results/anomaly_scores.json stage 1 scores + per-user thresholds
-  data/train.jsonl            training events for user op profiles
+FP suppression (applied to model-only flags, never rule flags):
+  Suppression 1 — Marginal score : score < threshold + 10% → suppress
+  Suppression 2 — Alert storm    : user has >5 model flags → keep only highest
 
-Output:
-  results/stage2_results.json precision/recall/F1 after each rule
-  results/stage2_alerts.json  windows surviving all rules (input to stage 3)
+Usage:
+    # Default — finetuned model results
+    python stage2_filter.py
+
+    # Custom paths / sigma
+    python stage2_filter.py \\
+        --scores-file data/tenant_test/finetuned/anomaly_scores.json \\
+        --events-file data/tenant_test/anomaly_test.jsonl \\
+        --sigma 2.0
+
+    # Tune rule sensitivity
+    python stage2_filter.py --mass-download-threshold 6 --brute-force-threshold 8
 """
 
+import argparse
+import hashlib
 import json
-import math
+from collections import defaultdict
+from datetime import datetime
 from pathlib import Path
-from collections import defaultdict, Counter
 
-import torch
+# ── Defaults ───────────────────────────────────────────────────────────────────
+DEFAULT_SCORES_FILE          = "data/tenant_test/finetuned/anomaly_scores.json"
+DEFAULT_EVENTS_FILE          = "data/tenant_test/anomaly_test.jsonl"
+DEFAULT_SIGMA                = 2.0
+DEFAULT_MARGINAL_PCT         = 0.10
+DEFAULT_STORM_LIMIT          = 5
+DEFAULT_MASS_DL_THRESHOLD    = 8
+DEFAULT_MASS_DL_WINDOW_S     = 300
+DEFAULT_BRUTE_THRESHOLD      = 10
+DEFAULT_BRUTE_WINDOW_S       = 60
 
-DATA_DIR    = Path("data")
-RES_DIR     = Path("results")
-N_SIGMA     = 3.0   # must match train_transformer.py
-MARGINAL_PCT = 0.10  # rule 2: suppress if score < threshold * (1 + this)
-STORM_LIMIT  = 5    # rule 3: max flags per user before storm suppression
-PAD_RATIO    = 0.50  # rule 1: suppress if padding fraction exceeds this
-TOP_N_OPS    = 3    # rule 4: suppress if dominant op in user's top-N
 
-
-# ── Helpers ───────────────────────────────────────────────────────────────────
+# ── Helpers ────────────────────────────────────────────────────────────────────
 
 def load_jsonl(path: Path) -> list[dict]:
-    events = []
     with open(path, encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if line:
-                events.append(json.loads(line))
-    return events
+        return [json.loads(l) for l in f if l.strip()]
+
+
+def uid_hash(email: str) -> str:
+    return hashlib.md5(email.encode()).hexdigest()[:4]
+
+
+def parse_time(ts: str) -> datetime:
+    return datetime.fromisoformat(ts.replace("Z", "+00:00"))
 
 
 def metrics(predicted: list[bool], labels: list[bool]) -> dict:
     tp = sum(p and l for p, l in zip(predicted, labels))
     fp = sum(p and not l for p, l in zip(predicted, labels))
     fn = sum(not p and l for p, l in zip(predicted, labels))
-    tn = sum(not p and not l for p, l in zip(predicted, labels))
     precision = tp / max(tp + fp, 1)
     recall    = tp / max(tp + fn, 1)
     f1        = 2 * precision * recall / max(precision + recall, 1e-8)
     return {
-        "tp": tp, "fp": fp, "fn": fn, "tn": tn,
+        "tp": tp, "fp": fp, "fn": fn,
         "precision": round(precision, 4),
         "recall":    round(recall, 4),
         "f1":        round(f1, 4),
+        "flagged":   sum(predicted),
     }
 
 
 def print_metrics(label: str, m: dict):
-    print(f"\n  {label}")
-    print(f"    TP={m['tp']}  FP={m['fp']}  FN={m['fn']}  TN={m['tn']}")
-    print(f"    Precision={m['precision']:.3f}  "
-          f"Recall={m['recall']:.3f}  F1={m['f1']:.3f}")
+    print(f"  {label:<42} "
+          f"TP={m['tp']:3d}  FP={m['fp']:4d}  FN={m['fn']:3d}  "
+          f"P={m['precision']:.3f}  R={m['recall']:.3f}  "
+          f"F1={m['f1']:.3f}  Flagged={m['flagged']}")
 
 
-# ── Build per-user operation profiles from training data ──────────────────────
+# ── Rule engine ────────────────────────────────────────────────────────────────
 
-def build_user_op_profiles(train_events: list[dict]) -> dict[str, Counter]:
+def rule_mass_download(events: list[dict], threshold: int, window_s: int) -> set[str]:
     """
-    For each user, count how many times they performed each operation.
-    Used by Rule 4 to check if flagged operation is routine for that user.
+    Flag user hashes where ≥threshold FileDownloaded events occur within
+    window_s seconds of each other.
     """
-    import hashlib
-    profiles: dict[str, Counter] = defaultdict(Counter)
-    for event in train_events:
-        uid = event.get("UserId", "unknown")
-        uid_hash = hashlib.md5(uid.encode()).hexdigest()[:4]
-        op  = event.get("Operation", "UNKNOWN")
-        profiles[uid_hash][op] += 1
-    return profiles
+    user_times: dict[str, list[datetime]] = defaultdict(list)
+    for e in events:
+        if e.get("Operation") == "FileDownloaded":
+            uid = e.get("UserId", "")
+            try:
+                user_times[uid].append(parse_time(e["CreationTime"]))
+            except (KeyError, ValueError):
+                pass
+
+    triggered: set[str] = set()
+    for uid, times in user_times.items():
+        times.sort()
+        for i, t0 in enumerate(times):
+            count = sum(
+                1 for t in times[i:]
+                if (t - t0).total_seconds() <= window_s
+            )
+            if count >= threshold:
+                triggered.add(uid_hash(uid))
+                break
+    return triggered
 
 
-def get_dominant_op(window_tokens: list[int], vocab_id2tok: list[str]) -> str | None:
+def rule_brute_force(events: list[dict], threshold: int, window_s: int) -> set[str]:
     """
-    Find the most frequent operation token in a window.
-    Returns the operation name (without 'op:' prefix) or None.
+    Flag user hashes where ≥threshold UserLoginFailed events from the same IP
+    occur within window_s seconds of each other.
     """
-    op_counts: Counter = Counter()
-    for tok_id in window_tokens:
-        if tok_id < len(vocab_id2tok):
-            tok = vocab_id2tok[tok_id]
-            if tok.startswith("op:"):
-                op_counts[tok[3:]] += 1
-    if op_counts:
-        return op_counts.most_common(1)[0][0]
-    return None
+    ip_entries: dict[str, list[tuple[datetime, str]]] = defaultdict(list)
+    for e in events:
+        if e.get("Operation") == "UserLoginFailed":
+            ip  = e.get("ClientIP", "unknown")
+            uid = e.get("UserId", "")
+            try:
+                ip_entries[ip].append((parse_time(e["CreationTime"]), uid))
+            except (KeyError, ValueError):
+                pass
+
+    triggered: set[str] = set()
+    for ip, entries in ip_entries.items():
+        entries.sort()
+        for i, (t0, _) in enumerate(entries):
+            window = [
+                (t, u) for t, u in entries[i:]
+                if (t - t0).total_seconds() <= window_s
+            ]
+            if len(window) >= threshold:
+                for _, uid in window:
+                    triggered.add(uid_hash(uid))
+                break
+    return triggered
 
 
-# ── Main ──────────────────────────────────────────────────────────────────────
+# ── FP suppression ─────────────────────────────────────────────────────────────
+
+def suppress_marginal(
+    flags: list[bool],
+    scores: list[float],
+    threshold: float,
+    rule_flags: list[bool],
+    pct: float,
+) -> tuple[list[bool], int]:
+    """Suppress model flags with scores barely above threshold. Never suppresses rule flags."""
+    out = list(flags)
+    suppressed = 0
+    for i, flagged in enumerate(out):
+        if flagged and not rule_flags[i] and scores[i] < threshold * (1 + pct):
+            out[i] = False
+            suppressed += 1
+    return out, suppressed
+
+
+def suppress_storm(
+    flags: list[bool],
+    scores: list[float],
+    user_ids: list[str],
+    rule_flags: list[bool],
+    limit: int,
+) -> tuple[list[bool], int]:
+    """
+    For users with >limit model-only flags, keep only the highest-scoring window.
+    Never suppresses rule-flagged windows.
+    """
+    user_model_indices: dict[str, list[int]] = defaultdict(list)
+    for i, flagged in enumerate(flags):
+        if flagged and not rule_flags[i]:
+            user_model_indices[user_ids[i]].append(i)
+
+    out = list(flags)
+    suppressed = 0
+    for uid, indices in user_model_indices.items():
+        if len(indices) > limit:
+            best = max(indices, key=lambda i: scores[i])
+            for i in indices:
+                if i != best:
+                    out[i] = False
+                    suppressed += 1
+    return out, suppressed
+
+
+# ── Main ───────────────────────────────────────────────────────────────────────
 
 def main():
-    print("=" * 60)
-    print("  LogSentinel Stage 2 — Rule-based Filter")
-    print("=" * 60)
-
-    RES_DIR.mkdir(exist_ok=True)
-
-    # ── Load data ─────────────────────────────────────────────────────────────
-    print("\nLoading data...")
-
-    test_windows  = torch.load(DATA_DIR / "test_tokens.pt",  weights_only=True)
-    test_labels_t = torch.load(DATA_DIR / "test_labels.pt",  weights_only=True)
-    test_labels   = test_labels_t.tolist()
-    test_user_ids = json.loads((DATA_DIR / "test_user_ids.json").read_text())
-    vocab         = json.loads((DATA_DIR / "tokeniser.json").read_text())
-    stage1        = json.loads((RES_DIR  / "anomaly_scores.json").read_text())
-
-    PAD_ID   = vocab["special"]["PAD"]
-    id2tok   = vocab["id2tok"]
-    ctx_len  = test_windows.shape[1]
-
-    print(f"  Test windows:     {len(test_windows):,}")
-    print(f"  Anomalous:        {sum(test_labels)}")
-    print(f"  Context length:   {ctx_len}")
-
-    # ── Reconstruct Stage 1 predictions ──────────────────────────────────────
-    # Stage 1 used per-user thresholds. Reconstruct which windows were flagged.
-    test_scores = stage1["test_scores"]
-
-    # Rebuild per-user thresholds from val scores saved in anomaly_scores.json
-    # Fall back to global threshold for users not in val set
-    global_threshold = stage1["global_threshold"]
-
-    # We need to re-derive per-user thresholds. Since we saved val_user_ids,
-    # load them and recompute from the val scores stored in the results.
-    # Simpler: just use global threshold for Stage 2 filter demonstration.
-    # The key insight is Stage 2 operates on *already-flagged* windows.
-
-    import statistics, hashlib
-
-    val_user_ids = json.loads((DATA_DIR / "val_user_ids.json").read_text())
-
-    # We don't have val scores saved directly, so we use global threshold
-    # with per-user marginal check (rule 2 handles the per-user aspect)
-    stage1_flags = [s > global_threshold for s in test_scores]
-
-    stage1_metrics = metrics(stage1_flags, test_labels)
-    print_metrics("Stage 1 (global threshold baseline):", stage1_metrics)
-
-    n_flagged = sum(stage1_flags)
-    print(f"\n  Stage 1 flagged {n_flagged} windows for Stage 2 review")
-
-    # ── Build user operation profiles ─────────────────────────────────────────
-    print("\nBuilding user operation profiles from training data...")
-    train_events = load_jsonl(DATA_DIR / "train.jsonl")
-    user_op_profiles = build_user_op_profiles(train_events)
-    print(f"  Profiles built for {len(user_op_profiles)} users")
-
-    # ── Apply rules ───────────────────────────────────────────────────────────
-    # Start with Stage 1 flagged windows, apply each rule in sequence
-    # active[i] = True means window i is still flagged after rules so far
-
-    active = list(stage1_flags)
-    results = {"stage1": stage1_metrics}
-
-    # ── Rule 1: Padding ratio ─────────────────────────────────────────────────
-    print("\nApplying Rule 1 — Padding ratio...")
-    suppressed_r1 = 0
-    for i, flagged in enumerate(active):
-        if not flagged:
-            continue
-        window  = test_windows[i].tolist()
-        pad_count = window.count(PAD_ID)
-        if pad_count / ctx_len > PAD_RATIO:
-            active[i] = False
-            suppressed_r1 += 1
-
-    m1 = metrics(active, test_labels)
-    print(f"  Suppressed {suppressed_r1} windows (>{PAD_RATIO*100:.0f}% padding)")
-    print_metrics("After Rule 1:", m1)
-    results["after_rule1_padding"] = m1
-
-    # ── Rule 2: Marginal score ────────────────────────────────────────────────
-    print("\nApplying Rule 2 — Marginal score...")
-    suppressed_r2 = 0
-    for i, flagged in enumerate(active):
-        if not flagged:
-            continue
-        score     = test_scores[i]
-        threshold = global_threshold
-        # Only suppress if score is barely above threshold
-        if score < threshold * (1 + MARGINAL_PCT):
-            active[i] = False
-            suppressed_r2 += 1
-
-    m2 = metrics(active, test_labels)
-    print(f"  Suppressed {suppressed_r2} windows (score < threshold + {MARGINAL_PCT*100:.0f}%)")
-    print_metrics("After Rule 2:", m2)
-    results["after_rule2_marginal"] = m2
-
-    # ── Rule 3: Alert storm ───────────────────────────────────────────────────
-    print("\nApplying Rule 3 — Alert storm...")
-    # Group flagged windows by user, keep only the highest-scoring one
-    # if a user has more than STORM_LIMIT flags
-    user_flags: dict[str, list[int]] = defaultdict(list)
-    for i, flagged in enumerate(active):
-        if flagged:
-            uid = test_user_ids[i]
-            user_flags[uid].append(i)
-
-    suppressed_r3 = 0
-    for uid, indices in user_flags.items():
-        if len(indices) > STORM_LIMIT:
-            # Keep only the highest-scoring window, suppress the rest
-            best_idx = max(indices, key=lambda i: test_scores[i])
-            for i in indices:
-                if i != best_idx:
-                    active[i] = False
-                    suppressed_r3 += 1
-
-    m3 = metrics(active, test_labels)
-    print(f"  Suppressed {suppressed_r3} windows (alert storm >{STORM_LIMIT} per user)")
-    print_metrics("After Rule 3:", m3)
-    results["after_rule3_storm"] = m3
-
-    # Rule 4 removed — suppressing windows by dominant operation type
-    # also suppresses genuine attacks (credential theft uses UserLoggedIn
-    # which is every user's most common operation). Rule 4 hurt recall
-    # more than it helped precision.
-    m4 = m3  # final metrics = after rule 3
-
-    # ── Final summary ─────────────────────────────────────────────────────────
-    print("\n" + "=" * 60)
-    print("  STAGE 2 SUMMARY")
-    print("=" * 60)
-
-    total_suppressed = sum(stage1_flags) - sum(active)
-    print(f"\n  Stage 1 flagged:    {sum(stage1_flags):>6}")
-    print(f"  Stage 2 suppressed: {total_suppressed:>6}")
-    print(f"  Remaining alerts:   {sum(active):>6}")
-    print(f"\n  False positive reduction: "
-          f"{total_suppressed / max(stage1_metrics['fp'], 1) * 100:.1f}%")
-
-    print(f"\n  Final metrics:")
-    final = m3
-    print(f"    Precision: {final['precision']:.3f}  "
-          f"(was {stage1_metrics['precision']:.3f})")
-    print(f"    Recall:    {final['recall']:.3f}  "
-          f"(was {stage1_metrics['recall']:.3f})")
-    print(f"    F1:        {final['f1']:.3f}  "
-          f"(was {stage1_metrics['f1']:.3f})")
-    print(f"    Missed anomalies: {final['fn']}")
-
-    # ── Save surviving alerts for Stage 3 ────────────────────────────────────
-    surviving = []
-    for i, flagged in enumerate(active):
-        surviving.append({
-            "window_idx":    i,
-            "user_id":       test_user_ids[i],
-            "score":         round(test_scores[i], 4),
-            "is_anomalous":  test_labels[i],
-            "stage2_flag":   flagged,
-        })
-
-    alerts = [s for s in surviving if s["stage2_flag"]]
-    (RES_DIR / "stage2_alerts.json").write_text(
-        json.dumps(alerts, indent=2)
+    parser = argparse.ArgumentParser(
+        description="LogSentinel Stage 2 — Hybrid Detection"
     )
-    print(f"\n  Stage 3 input saved: {len(alerts)} alerts → results/stage2_alerts.json")
+    parser.add_argument("--scores-file",
+                        default=DEFAULT_SCORES_FILE,
+                        help="Path to anomaly_scores.json from finetune.py or detect.py")
+    parser.add_argument("--events-file",
+                        default=DEFAULT_EVENTS_FILE,
+                        help="Path to raw test events JSONL")
+    parser.add_argument("--sigma",
+                        type=float, default=DEFAULT_SIGMA,
+                        help="Model threshold = val_mean + sigma * val_std")
+    parser.add_argument("--marginal-pct",
+                        type=float, default=DEFAULT_MARGINAL_PCT,
+                        help="Suppress model flags within this %% above threshold")
+    parser.add_argument("--storm-limit",
+                        type=int, default=DEFAULT_STORM_LIMIT,
+                        help="Max model flags per user before storm suppression")
+    parser.add_argument("--mass-download-threshold",
+                        type=int, default=DEFAULT_MASS_DL_THRESHOLD,
+                        help="Min FileDownloaded events to trigger mass_download rule")
+    parser.add_argument("--mass-download-window",
+                        type=int, default=DEFAULT_MASS_DL_WINDOW_S,
+                        help="Time window in seconds for mass_download rule")
+    parser.add_argument("--brute-force-threshold",
+                        type=int, default=DEFAULT_BRUTE_THRESHOLD,
+                        help="Min failed logins from same IP to trigger brute_force rule")
+    parser.add_argument("--brute-force-window",
+                        type=int, default=DEFAULT_BRUTE_WINDOW_S,
+                        help="Time window in seconds for brute_force rule")
+    args = parser.parse_args()
 
-    results["final"] = final
-    results["stage1_flagged"]    = sum(stage1_flags)
-    results["stage2_suppressed"] = total_suppressed
-    results["stage2_remaining"]  = sum(active)
-    results["fp_reduction_pct"]  = round(
-        total_suppressed / max(stage1_metrics["fp"], 1) * 100, 1
-    )
+    scores_path = Path(args.scores_file)
+    events_path = Path(args.events_file)
+    out_dir     = scores_path.parent
 
-    (RES_DIR / "stage2_results.json").write_text(
-        json.dumps(results, indent=2)
-    )
-    print(f"  Full results saved → results/stage2_results.json")
+    print("=" * 74)
+    print("  LogSentinel Stage 2 — Hybrid Detection")
+    print("=" * 74)
+    print(f"\n  Scores:  {scores_path}")
+    print(f"  Events:  {events_path}")
+    print(f"  Sigma:   {args.sigma}")
+
+    # ── Load ──────────────────────────────────────────────────────────────────
+    stage1   = json.loads(scores_path.read_text())
+    scores   = stage1["test_scores"]
+    labels   = [bool(l) for l in stage1["test_labels"]]
+    user_ids = stage1["test_user_ids"]
+
+    val_mean = stage1.get("val_mean")
+    val_std  = stage1.get("val_std")
+    if val_mean is None or val_std is None:
+        raise ValueError(
+            "anomaly_scores.json is missing val_mean/val_std. "
+            "Re-run finetune.py to regenerate."
+        )
+
+    threshold = val_mean + args.sigma * val_std
+    events    = load_jsonl(events_path)
+
+    print(f"\n  Windows:          {len(scores):,}")
+    print(f"  Anomalous:        {sum(labels)}")
+    print(f"  Val distribution: mean={val_mean:.2f}  std={val_std:.2f}")
+    print(f"  Threshold:        {threshold:.2f}  (sigma={args.sigma})")
+
+    # ── Stage 1: model flags ──────────────────────────────────────────────────
+    model_flags = [s > threshold for s in scores]
+    m_model     = metrics(model_flags, labels)
+
+    # ── Rule engine ───────────────────────────────────────────────────────────
+    print("\n  Running rule engine on raw events...")
+    md_users  = rule_mass_download(
+        events, args.mass_download_threshold, args.mass_download_window)
+    bf_users  = rule_brute_force(
+        events, args.brute_force_threshold, args.brute_force_window)
+
+    all_rule_users = md_users | bf_users
+    print(f"    mass_download triggered: {len(md_users):2d} users  — {sorted(md_users)}")
+    print(f"    brute_force   triggered: {len(bf_users):2d} users  — {sorted(bf_users)}")
+
+    rule_flags = [uid in all_rule_users for uid in user_ids]
+    m_rules    = metrics(rule_flags, labels)
+
+    # ── Combined (model OR rules) ──────────────────────────────────────────────
+    combined_flags = [m or r for m, r in zip(model_flags, rule_flags)]
+    m_combined     = metrics(combined_flags, labels)
+
+    # ── FP suppression (model-only flags only) ────────────────────────────────
+    after_marginal, n_marginal = suppress_marginal(
+        combined_flags, scores, threshold, rule_flags, args.marginal_pct)
+    after_storm, n_storm = suppress_storm(
+        after_marginal, scores, user_ids, rule_flags, args.storm_limit)
+    m_final = metrics(after_storm, labels)
+
+    # ── Report ────────────────────────────────────────────────────────────────
+    W = 74
+    print(f"\n{'─' * W}")
+    print(f"  {'Stage':<42} {'TP':>4}  {'FP':>5}  {'FN':>4}  "
+          f"{'P':>6}  {'R':>6}  {'F1':>6}  {'Flagged':>7}")
+    print(f"{'─' * W}")
+    print_metrics("1. Model only",               m_model)
+    print_metrics("2. Rules only",               m_rules)
+    print_metrics("3. Combined (model OR rules)", m_combined)
+    print_metrics("4. Combined + FP suppression", m_final)
+    print(f"{'─' * W}")
+
+    print(f"\n  FP suppression removed: {n_marginal} marginal + {n_storm} storm "
+          f"= {n_marginal + n_storm} total")
+    print(f"  Missed anomalies (final): {m_final['fn']}")
+    if m_final["tp"] > 0:
+        print(f"  FP per TP (final):        {m_final['fp'] / m_final['tp']:.2f}")
+
+    # ── Save ──────────────────────────────────────────────────────────────────
+    results = {
+        "config": {
+            "sigma":                    args.sigma,
+            "threshold":                round(threshold, 4),
+            "val_mean":                 val_mean,
+            "val_std":                  val_std,
+            "mass_download_threshold":  args.mass_download_threshold,
+            "mass_download_window_s":   args.mass_download_window,
+            "brute_force_threshold":    args.brute_force_threshold,
+            "brute_force_window_s":     args.brute_force_window,
+            "marginal_pct":             args.marginal_pct,
+            "storm_limit":              args.storm_limit,
+        },
+        "rule_triggered_users": {
+            "mass_download": sorted(md_users),
+            "brute_force":   sorted(bf_users),
+        },
+        "metrics": {
+            "model_only":   m_model,
+            "rules_only":   m_rules,
+            "combined":     m_combined,
+            "final":        m_final,
+        },
+    }
+
+    out_path = out_dir / "stage2_results.json"
+    out_path.write_text(json.dumps(results, indent=2))
+    print(f"\n  Results saved → {out_path}")
+    print("=" * 74)
 
 
 if __name__ == "__main__":
