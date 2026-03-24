@@ -1,4 +1,5 @@
 data/
+!data/tenant_test/
 checkpoints/
 logs/
 results/
@@ -9,8 +10,3 @@ __pycache__/
 *.pyc
 .env
 venv/
-data/
-checkpoints/
-results/
-*.h5
-*.pt
