@@ -95,7 +95,7 @@ def parse_time(ts):
 
 DOWNLOAD_OPS = {"FileDownloaded","FileSyncDownloadedFull","FileSyncDownloadedPartial","FileAccessed"}
 
-# Rule: mass_download
+# Rule: mass_download only (model handles everything else at high recall)
 rule_md_users = set()
 user_dl = defaultdict(list)
 for e in events:
@@ -112,28 +112,6 @@ for uid, evts in user_dl.items():
             break
         i += 1
 
-# Rule: brute_force
-rule_bf_users = set()
-ip_fails = defaultdict(list)
-for e in events:
-    if e.get('Operation') == 'UserLoginFailed':
-        ip_fails[e.get('ClientIP','')].append(e)
-for ip, evts in ip_fails.items():
-    evts.sort(key=lambda e: parse_time(e['CreationTime']))
-    i = 0
-    while i < len(evts):
-        anchor = parse_time(evts[i]['CreationTime'])
-        burst = [e for e in evts[i:] if parse_time(e['CreationTime']) <= anchor + timedelta(seconds=60)]
-        if len(burst) >= 10:
-            for e in burst:
-                rule_bf_users.add(e.get('UserId',''))
-            break
-        i += 1
-
-# Rule: mfa_disabled
-rule_mfa_users = {e.get('UserId','') for e in events
-                  if e.get('Operation') == 'Disable Strong Authentication'}
-
 # email lookup
 hash_to_email = {}
 for e in events:
@@ -143,8 +121,6 @@ for e in events:
 
 rule_coverage = {
     'mass_download': rule_md_users,
-    'brute_force':   rule_bf_users,
-    'mfa_disabled':  rule_mfa_users,
 }
 
 # ── Per-window predictions ─────────────────────────────────────────────────────

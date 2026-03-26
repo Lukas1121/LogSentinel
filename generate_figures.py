@@ -96,27 +96,9 @@ for uid, evts in user_dl.items():
             rule_md_users.add(uid); break
         i += 1
 
-rule_bf_users = set()
-ip_fails = defaultdict(list)
-for e in events:
-    if e.get("Operation") == "UserLoginFailed":
-        ip_fails[e.get("ClientIP","")].append(e)
-for ip, evts in ip_fails.items():
-    evts.sort(key=lambda e: parse_time(e["CreationTime"]))
-    i = 0
-    while i < len(evts):
-        burst = [x for x in evts[i:] if parse_time(x["CreationTime"]) <= parse_time(evts[i]["CreationTime"]) + timedelta(seconds=60)]
-        if len(burst) >= 10:
-            for x in burst: rule_bf_users.add(x.get("UserId",""))
-            break
-        i += 1
-
-rule_mfa_users = {e.get("UserId","") for e in events if e.get("Operation") == "Disable Strong Authentication"}
-
+# mass_download rule only — model handles all other anomaly types at high recall
 rule_coverage = {
     "mass_download": rule_md_users,
-    "brute_force":   rule_bf_users,
-    "mfa_disabled":  rule_mfa_users,
 }
 
 # ── Per-type recall (rigorous) ─────────────────────────────────────────────────
