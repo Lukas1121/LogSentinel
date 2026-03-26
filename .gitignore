@@ -2,7 +2,7 @@ data/
 !data/tenant_test/
 checkpoints/
 logs/
-results/
+
 !results/figures/
 !results/figures/*.png
 *.h5
