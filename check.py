@@ -162,4 +162,54 @@ else:
     for atype, users in sorted(missed_types.items()):
         print(f"  {atype:<25}  {len(users)} user(s): {', '.join(sorted(users))}")
 
+# Section 5: Honest check — missed windows caught only by a DIFFERENT rule
+print(f"\n{'─' * 66}")
+print(f"  Honest check: missed windows caught only via a DIFFERENT anomaly rule")
+print(f"{'─' * 66}")
+
+# For each missed model window, check what anomaly type it contains
+# vs what rule(s) caught the user
+user_anomaly_types = defaultdict(set)
+for e in events:
+    if '_anomaly' in e:
+        uid = e.get('UserId', '')
+        user_anomaly_types[uid].add(e['_anomaly']['type'])
+
+rule_coverage = {
+    'mass_download': rule_md_users,
+    'brute_force':   rule_bf_users,
+    'mfa_disabled':  rule_mfa_users,
+}
+
+cross_caught = []  # windows only caught because user was flagged for something else
+directly_caught = []
+
+for score, label, uid_h in zip(scores, labels, user_ids):
+    if label and score < threshold:  # model missed this window
+        email = hash_to_email.get(uid_h, '')
+        if email not in all_rule_users:
+            continue  # not caught by rules either — already shown in FN
+        # Find which anomaly types this user has
+        user_types = user_anomaly_types.get(email, set())
+        # Find which rules caught them
+        catching_rules = {rt for rt, users in rule_coverage.items() if email in users}
+        # Are all their anomaly types covered by a rule that fires for that type?
+        directly = user_types & catching_rules  # types caught by correct rule
+        cross     = user_types - catching_rules  # types only caught via different rule
+        if cross:
+            cross_caught.append((email, cross, catching_rules))
+        else:
+            directly_caught.append((email, directly))
+
+if not cross_caught:
+    print("  All rule-assisted detections are for the correct anomaly type.")
+    print("  No inflation — every detected anomaly is caught by a matching rule.")
+else:
+    print(f"  {len(cross_caught)} case(s) where a user is caught by rule for type A")
+    print(f"  but their missed windows contain type B:")
+    for email, cross_types, catching in cross_caught:
+        print(f"    {email}")
+        print(f"      Caught via:      {', '.join(sorted(catching))}")
+        print(f"      Anomaly missed:  {', '.join(sorted(cross_types))}")
+
 print("=" * 66)
