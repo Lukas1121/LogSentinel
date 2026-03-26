@@ -1,46 +1,48 @@
 """
 stage2_filter.py
-Burst download detection for LogSentinel.
+Rule-based anomaly detection for LogSentinel.
 
-Scans raw M365 audit log events per user for download bursts — a high
-number of file download events within a short rolling time window.
+Three independent rules, each scanning raw M365 audit log events:
 
-Works directly on raw JSONL events. No transformer, no windows, no model
-scores required. Each user's event stream is scanned independently.
+  Rule 1 — mass_download  : >= BURST_THRESHOLD FileDownloaded from same user
+                             within BURST_WINDOW_MINUTES
+  Rule 2 — brute_force    : >= BRUTE_THRESHOLD UserLoginFailed from same IP
+                             within BRUTE_WINDOW_SECONDS
+  Rule 3 — mfa_disabled   : any occurrence of "Disable Strong Authentication"
 
-A burst is defined as: >= THRESHOLD download events from the same user
-within any WINDOW_MINUTES minute interval. All download events within
-that interval are flagged and reported.
-
-Multi-platform aware: counts downloads across SharePoint, OneDrive, and
-any other workload. Each flagged event records its source platform.
+No transformer scores required. Works directly on raw JSONL events.
 
 Usage:
     python stage2_filter.py
     python stage2_filter.py --events-file data/tenant_test/anomaly_test.jsonl
-    python stage2_filter.py --window-minutes 10 --threshold 15
     python stage2_filter.py --events-file data/tenant_real/logs.jsonl --out alerts.json
 """
 
 import argparse
 import json
 from collections import defaultdict
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 from pathlib import Path
 
-# ── Download operations to monitor ────────────────────────────────────────────
-# Add any M365 operation name that represents a file download.
+# ── Operation sets ─────────────────────────────────────────────────────────────
+
 DOWNLOAD_OPS = {
     "FileDownloaded",
     "FileSyncDownloadedFull",
     "FileSyncDownloadedPartial",
-    "FileAccessed",          # broad — remove if too noisy for your tenant
+    "FileAccessed",
 }
 
+BRUTE_FORCE_OP  = "UserLoginFailed"
+MFA_DISABLED_OP = "Disable Strong Authentication"
+
 # ── Defaults ───────────────────────────────────────────────────────────────────
-DEFAULT_EVENTS_FILE    = "data/tenant_test/anomaly_test.jsonl"
-DEFAULT_WINDOW_MINUTES = 5
-DEFAULT_THRESHOLD      = 8
+
+DEFAULT_EVENTS_FILE        = "data/tenant_test/anomaly_test.jsonl"
+DEFAULT_BURST_WINDOW       = 5      # minutes
+DEFAULT_BURST_THRESHOLD    = 8      # downloads in window
+DEFAULT_BRUTE_WINDOW       = 60     # seconds
+DEFAULT_BRUTE_THRESHOLD    = 10     # failed logins from same IP in window
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
@@ -54,45 +56,22 @@ def parse_time(ts: str) -> datetime:
     return datetime.fromisoformat(ts.replace("Z", "+00:00"))
 
 
-# ── Burst detection ────────────────────────────────────────────────────────────
+# ── Rule 1: Mass download burst ────────────────────────────────────────────────
 
-def detect_bursts(
-    events: list[dict],
-    window_minutes: int,
-    threshold: int,
-) -> list[dict]:
+def detect_mass_download(events, window_minutes, threshold):
     """
-    Scan all events for per-user download bursts.
-
-    For each user, collect their download events sorted by time.
-    Slide a window of `window_minutes` minutes: if any window contains
-    >= threshold events, all events in that window are flagged as a burst.
-
-    Overlapping bursts are merged — once a burst starts, all download events
-    within window_minutes of the first event are included before looking
-    for the next independent burst.
-
-    Returns a list of burst dicts, each containing:
-        user_id       : user who triggered the burst
-        burst_start   : timestamp of first download in burst
-        burst_end     : timestamp of last download in burst
-        event_count   : number of download events in burst
-        platforms     : set of workloads (SharePoint, OneDrive, ...)
-        events        : list of the raw event dicts in the burst
-        is_true_positive : True if any event has _anomaly label (eval only)
+    Flag users with >= threshold download events within any window_minutes window.
+    Returns list of alert dicts.
     """
     window = timedelta(minutes=window_minutes)
 
-    # Group download events by user
-    user_downloads: dict[str, list[dict]] = defaultdict(list)
+    user_downloads = defaultdict(list)
     for e in events:
         if e.get("Operation") in DOWNLOAD_OPS:
             user_downloads[e.get("UserId", "unknown")].append(e)
 
-    bursts = []
-
+    alerts = []
     for user_id, dl_events in user_downloads.items():
-        # Sort by time
         try:
             dl_events.sort(key=lambda e: parse_time(e["CreationTime"]))
         except (KeyError, ValueError):
@@ -102,144 +81,221 @@ def detect_bursts(
         while i < len(dl_events):
             anchor_time = parse_time(dl_events[i]["CreationTime"])
             window_end  = anchor_time + window
-
-            # Collect all events within window_minutes of anchor
             burst_events = [
                 e for e in dl_events[i:]
                 if parse_time(e["CreationTime"]) <= window_end
             ]
-
             if len(burst_events) >= threshold:
-                platforms = {e.get("Workload", "Unknown") for e in burst_events}
-                is_tp     = any("_anomaly" in e for e in burst_events)
-                bursts.append({
-                    "user_id":          user_id,
-                    "burst_start":      dl_events[i]["CreationTime"],
-                    "burst_end":        burst_events[-1]["CreationTime"],
-                    "event_count":      len(burst_events),
-                    "platforms":        sorted(platforms),
+                is_tp = any("_anomaly" in e for e in burst_events)
+                alerts.append({
+                    "rule":        "mass_download",
+                    "user_id":     user_id,
+                    "start":       dl_events[i]["CreationTime"],
+                    "end":         burst_events[-1]["CreationTime"],
+                    "event_count": len(burst_events),
+                    "detail":      f"{len(burst_events)} downloads in {window_minutes}m",
                     "is_true_positive": is_tp,
-                    "events":           burst_events,
                 })
-                # Skip past this burst before looking for the next one
                 i += len(burst_events)
             else:
                 i += 1
 
-    # Sort output by time
-    bursts.sort(key=lambda b: b["burst_start"])
-    return bursts
+    alerts.sort(key=lambda a: a["start"])
+    return alerts
+
+
+# ── Rule 2: Brute force login ──────────────────────────────────────────────────
+
+def detect_brute_force(events, window_seconds, threshold):
+    """
+    Flag source IPs with >= threshold UserLoginFailed events within window_seconds.
+    Returns list of alert dicts.
+    """
+    window = timedelta(seconds=window_seconds)
+
+    ip_failures = defaultdict(list)
+    for e in events:
+        if e.get("Operation") == BRUTE_FORCE_OP:
+            ip = e.get("ClientIP", "unknown")
+            ip_failures[ip].append(e)
+
+    alerts = []
+    for ip, fail_events in ip_failures.items():
+        try:
+            fail_events.sort(key=lambda e: parse_time(e["CreationTime"]))
+        except (KeyError, ValueError):
+            continue
+
+        i = 0
+        while i < len(fail_events):
+            anchor_time = parse_time(fail_events[i]["CreationTime"])
+            window_end  = anchor_time + window
+            burst_events = [
+                e for e in fail_events[i:]
+                if parse_time(e["CreationTime"]) <= window_end
+            ]
+            if len(burst_events) >= threshold:
+                is_tp = any("_anomaly" in e for e in burst_events)
+                users = {e.get("UserId", "unknown") for e in burst_events}
+                alerts.append({
+                    "rule":        "brute_force",
+                    "source_ip":   ip,
+                    "start":       fail_events[i]["CreationTime"],
+                    "end":         burst_events[-1]["CreationTime"],
+                    "event_count": len(burst_events),
+                    "detail":      f"{len(burst_events)} failed logins from {ip} in {window_seconds}s targeting {len(users)} user(s)",
+                    "is_true_positive": is_tp,
+                })
+                i += len(burst_events)
+            else:
+                i += 1
+
+    alerts.sort(key=lambda a: a["start"])
+    return alerts
+
+
+# ── Rule 3: MFA disabled ───────────────────────────────────────────────────────
+
+def detect_mfa_disabled(events):
+    """
+    Flag every occurrence of MFA being disabled on an account.
+    Each event is its own alert — no window required.
+    Returns list of alert dicts.
+    """
+    alerts = []
+    for e in events:
+        if e.get("Operation") == MFA_DISABLED_OP:
+            is_tp = "_anomaly" in e
+            alerts.append({
+                "rule":        "mfa_disabled",
+                "user_id":     e.get("UserId", "unknown"),
+                "start":       e.get("CreationTime", ""),
+                "end":         e.get("CreationTime", ""),
+                "event_count": 1,
+                "detail":      f"MFA disabled on {e.get('UserId', 'unknown')}",
+                "is_true_positive": is_tp,
+            })
+    alerts.sort(key=lambda a: a["start"])
+    return alerts
 
 
 # ── Main ───────────────────────────────────────────────────────────────────────
 
 def main():
     parser = argparse.ArgumentParser(
-        description="LogSentinel Stage 2 — Burst Download Detection"
+        description="LogSentinel Stage 2 — Rule-Based Detection"
     )
-    parser.add_argument(
-        "--events-file", default=DEFAULT_EVENTS_FILE,
-        help="Path to raw events JSONL file",
-    )
-    parser.add_argument(
-        "--window-minutes", type=int, default=DEFAULT_WINDOW_MINUTES,
-        help=f"Rolling time window in minutes (default: {DEFAULT_WINDOW_MINUTES})",
-    )
-    parser.add_argument(
-        "--threshold", type=int, default=DEFAULT_THRESHOLD,
-        help=f"Min download events in window to trigger alert (default: {DEFAULT_THRESHOLD})",
-    )
-    parser.add_argument(
-        "--out", default=None,
-        help="Output JSON file for alerts (default: <events_dir>/burst_alerts.json)",
-    )
+    parser.add_argument("--events-file", default=DEFAULT_EVENTS_FILE)
+    parser.add_argument("--burst-window",    type=int, default=DEFAULT_BURST_WINDOW,
+                        help=f"Mass download window in minutes (default: {DEFAULT_BURST_WINDOW})")
+    parser.add_argument("--burst-threshold", type=int, default=DEFAULT_BURST_THRESHOLD,
+                        help=f"Min downloads to trigger burst alert (default: {DEFAULT_BURST_THRESHOLD})")
+    parser.add_argument("--brute-window",    type=int, default=DEFAULT_BRUTE_WINDOW,
+                        help=f"Brute force window in seconds (default: {DEFAULT_BRUTE_WINDOW})")
+    parser.add_argument("--brute-threshold", type=int, default=DEFAULT_BRUTE_THRESHOLD,
+                        help=f"Min failed logins to trigger brute force alert (default: {DEFAULT_BRUTE_THRESHOLD})")
+    parser.add_argument("--out", default=None,
+                        help="Output JSON file (default: <events_dir>/stage2_alerts.json)")
     args = parser.parse_args()
 
     events_path = Path(args.events_file)
-    out_path    = Path(args.out) if args.out else events_path.parent / "burst_alerts.json"
+    out_path    = Path(args.out) if args.out else events_path.parent / "stage2_alerts.json"
 
     print("=" * 66)
-    print("  LogSentinel Stage 2 — Burst Download Detection")
+    print("  LogSentinel Stage 2 — Rule-Based Detection")
     print("=" * 66)
-    print(f"\n  Events:         {events_path}")
-    print(f"  Window:         {args.window_minutes} minutes")
-    print(f"  Threshold:      >= {args.threshold} downloads in window")
-    print(f"  Monitored ops:  {sorted(DOWNLOAD_OPS)}")
+    print(f"\n  Events file:  {events_path}")
 
     events = load_jsonl(events_path)
-    print(f"\n  Loaded {len(events):,} events")
+    n_users = len({e.get("UserId") for e in events})
+    print(f"  Loaded {len(events):,} events across {n_users} users\n")
 
-    # Count users and download events
-    n_users     = len({e.get("UserId") for e in events})
-    n_downloads = sum(1 for e in events if e.get("Operation") in DOWNLOAD_OPS)
-    print(f"  Users:          {n_users}")
-    print(f"  Download events:{n_downloads:,}")
+    # ── Run all rules ─────────────────────────────────────────────────────────
+    md_alerts  = detect_mass_download(events, args.burst_window, args.burst_threshold)
+    bf_alerts  = detect_brute_force(events, args.brute_window, args.brute_threshold)
+    mfa_alerts = detect_mfa_disabled(events)
 
-    # Detect bursts
-    bursts = detect_bursts(events, args.window_minutes, args.threshold)
+    all_alerts = md_alerts + bf_alerts + mfa_alerts
+    all_alerts.sort(key=lambda a: a["start"])
 
-    # ── Report ────────────────────────────────────────────────────────────────
-    print(f"\n{'─' * 66}")
-    print(f"  Burst alerts detected: {len(bursts)}")
+    # ── Per-rule summary ──────────────────────────────────────────────────────
+    has_labels = any("_anomaly" in e for e in events)
+
+    rule_groups = [
+        ("mass_download", md_alerts),
+        ("brute_force",   bf_alerts),
+        ("mfa_disabled",  mfa_alerts),
+    ]
+
+    print(f"{'─' * 66}")
+    print(f"  {'Rule':<20} {'Alerts':>7}  {'TP':>4}  {'FP':>4}  {'Recall note'}")
     print(f"{'─' * 66}")
 
-    if not bursts:
-        print("  No bursts detected.")
-    else:
-        for b in bursts:
-            tp_marker = " [LABELED ANOMALY]" if b["is_true_positive"] else ""
-            print(f"\n  User:     {b['user_id']}{tp_marker}")
-            print(f"  Start:    {b['burst_start']}")
-            print(f"  End:      {b['burst_end']}")
-            print(f"  Events:   {b['event_count']} downloads")
-            print(f"  Platform: {', '.join(b['platforms'])}")
+    for rule_name, alerts in rule_groups:
+        n_alerts = len(alerts)
+        tp = sum(1 for a in alerts if a["is_true_positive"])
+        fp = sum(1 for a in alerts if not a["is_true_positive"])
 
-    # ── Evaluation summary (only if _anomaly labels present) ──────────────────
-    has_labels = any("_anomaly" in e for e in events)
-    if has_labels:
-        true_bursts  = sum(1 for b in bursts if b["is_true_positive"])
-        false_bursts = sum(1 for b in bursts if not b["is_true_positive"])
+        if has_labels:
+            labeled_users = {
+                e.get("UserId") for e in events
+                if e.get("_anomaly", {}).get("type") == rule_name
+            }
+            if rule_name == "brute_force":
+                # brute force alerts are per-IP not per-user
+                detected_users = {
+                    e.get("UserId") for a in alerts if a["is_true_positive"]
+                    for e in events
+                    if e.get("ClientIP") == a.get("source_ip") and "_anomaly" in e
+                }
+            else:
+                detected_users = {
+                    a.get("user_id") for a in alerts if a["is_true_positive"]
+                }
+            missed = labeled_users - detected_users
+            recall_note = f"{len(detected_users)}/{len(labeled_users)} users" if labeled_users else "no labels"
+        else:
+            recall_note = ""
 
-        # Count labeled mass_download users in events
-        labeled_md_users = {
-            e.get("UserId") for e in events
-            if e.get("_anomaly", {}).get("type") == "mass_download"
-        }
-        detected_md_users = {
-            b["user_id"] for b in bursts if b["is_true_positive"]
-        }
-        missed_md_users = labeled_md_users - detected_md_users
+        print(f"  {rule_name:<20} {n_alerts:>7}  {tp:>4}  {fp:>4}  {recall_note}")
 
-        print(f"\n{'─' * 66}")
-        print(f"  Evaluation (ground truth labels present)")
-        print(f"{'─' * 66}")
-        print(f"  Labeled mass_download users:   {len(labeled_md_users)}")
-        print(f"  Detected (true positives):     {true_bursts} bursts "
-              f"across {len(detected_md_users)} users")
-        print(f"  False positives:               {false_bursts} bursts")
-        print(f"  Missed users:                  {len(missed_md_users)} "
-              f"— {sorted(missed_md_users) or 'none'}")
-        if labeled_md_users:
-            recall = len(detected_md_users) / len(labeled_md_users)
-            print(f"  User-level recall:             {recall:.3f}")
+    print(f"{'─' * 66}")
+    total_tp = sum(1 for a in all_alerts if a["is_true_positive"])
+    total_fp = sum(1 for a in all_alerts if not a["is_true_positive"])
+    print(f"  {'TOTAL':<20} {len(all_alerts):>7}  {total_tp:>4}  {total_fp:>4}")
+    print(f"{'─' * 66}")
+
+    # ── Alert detail ──────────────────────────────────────────────────────────
+    if all_alerts:
+        print(f"\n  Alert detail:")
+        for a in all_alerts:
+            tp_marker = " [TP]" if a["is_true_positive"] else " [FP]"
+            label = a.get("user_id") or a.get("source_ip", "?")
+            print(f"  [{a['rule']:<14}]  {label:<35} {a['start'][:19]}  {a['detail']}{tp_marker if has_labels else ''}")
 
     # ── Save ──────────────────────────────────────────────────────────────────
     output = {
         "config": {
-            "events_file":    str(events_path),
-            "window_minutes": args.window_minutes,
-            "threshold":      args.threshold,
-            "download_ops":   sorted(DOWNLOAD_OPS),
+            "events_file":     str(events_path),
+            "burst_window_m":  args.burst_window,
+            "burst_threshold": args.burst_threshold,
+            "brute_window_s":  args.brute_window,
+            "brute_threshold": args.brute_threshold,
         },
         "summary": {
-            "total_events":   len(events),
-            "total_bursts":   len(bursts),
-            "users_flagged":  len({b["user_id"] for b in bursts}),
+            "total_alerts":  len(all_alerts),
+            "total_tp":      total_tp,
+            "total_fp":      total_fp,
+            "by_rule": {
+                name: {
+                    "alerts": len(alerts),
+                    "tp": sum(1 for a in alerts if a["is_true_positive"]),
+                    "fp": sum(1 for a in alerts if not a["is_true_positive"]),
+                }
+                for name, alerts in rule_groups
+            },
         },
-        "bursts": [
-            {k: v for k, v in b.items() if k != "events"}
-            for b in bursts
-        ],
+        "alerts": [{k: v for k, v in a.items()} for a in all_alerts],
     }
     out_path.write_text(json.dumps(output, indent=2))
     print(f"\n  Alerts saved → {out_path}")

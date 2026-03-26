@@ -10,3 +10,4 @@ __pycache__/
 *.pyc
 .env
 venv/
+linkedin_post.txt
