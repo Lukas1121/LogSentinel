@@ -137,7 +137,7 @@ type_order = ["brute_force","impossible_travel","mass_download",
               "mfa_disabled","new_country_login","off_hours_admin"]
 
 type_order_f  = [t for t in type_order if t in type_total]
-xlabels       = [TYPE_DISPLAY[t] for t in type_order_f]
+xlabels       = [f"{TYPE_DISPLAY[t]}\n(n={type_total[t]})" for t in type_order_f]
 model_recalls = [type_model_tp[t] / type_total[t] for t in type_order_f]
 combo_recalls = [type_combo_tp[t] / type_total[t] for t in type_order_f]
 
@@ -160,10 +160,23 @@ ax.axvline(threshold, color="#2ca02c", linewidth=2.0, linestyle="--",
 
 tp = int(((scores_arr >= threshold) & labels_arr).sum())
 fp = int(((scores_arr >= threshold) & ~labels_arr).sum())
-ax.annotate(f"σ=2.5 threshold\nTP={tp}  FP={fp}\nFP/TP = {fp/max(tp,1):.2f}",
+fn = int(((scores_arr < threshold)  & labels_arr).sum())
+ax.annotate(f"σ=2.5 threshold\nTP={tp}  FP={fp}  FN={fn}\nFP/TP = {fp/max(tp,1):.2f}",
             xy=(threshold + 0.25, ax.get_ylim()[1] * 0.70),
             fontsize=9.5, color="#2ca02c",
             bbox=dict(boxstyle="round,pad=0.3", fc="white", ec="#2ca02c", alpha=0.85))
+
+# Annotate the missed anomalous windows below threshold
+fn_scores = scores_arr[labels_arr & (scores_arr < threshold)]
+if len(fn_scores):
+    ax.annotate(
+        f"FN={fn}: bulk download windows\n(low perplexity — blends into normal activity)",
+        xy=(fn_scores.max(), 3),
+        xytext=(fn_scores.mean() - 1.5, 18),
+        fontsize=8.5, color="#DD4949",
+        arrowprops=dict(arrowstyle="->", color="#DD4949", lw=1.2),
+        bbox=dict(boxstyle="round,pad=0.3", fc="white", ec="#DD4949", alpha=0.85),
+    )
 
 ax.set_xlabel("Anomaly Score  (log-perplexity)", fontsize=12)
 ax.set_ylabel("Number of Windows", fontsize=12)
@@ -210,6 +223,17 @@ for bars, color in [(bars1, "#4C72B0"), (bars2, "#2ca02c")]:
             ax.text(bar.get_x() + bar.get_width()/2, h + 0.02,
                     f"{h:.0%}", ha="center", va="bottom",
                     fontsize=8.5, color=color, fontweight="bold")
+
+# Annotate the mass_download gap
+md_idx = type_order_f.index("mass_download")
+ax.annotate(
+    "Model blind spot:\nbulk exfiltration blends\ninto normal file activity.\nBurst rule fills the gap.",
+    xy=(md_idx - width/2 + width/2, model_recalls[md_idx] + 0.04),
+    xytext=(md_idx + 1.1, 0.55),
+    fontsize=8.5, color="#4C72B0",
+    arrowprops=dict(arrowstyle="->", color="#4C72B0", lw=1.2),
+    bbox=dict(boxstyle="round,pad=0.3", fc="white", ec="#4C72B0", alpha=0.85),
+)
 
 fig.tight_layout()
 out2 = OUT_DIR / "detection_breakdown.png"
