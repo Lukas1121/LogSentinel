@@ -283,10 +283,10 @@ def load_saved_scores(path: Path = RES_DIR / "anomaly_scores.json"):
     return scores, labels, val_mean, val_std
 
 
-def recompute_scores():
+def recompute_scores(ckpt_path=None, out_path=None):
     """Reload model from checkpoint and recompute scores from scratch."""
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    ckpt_path = CKPT_DIR / "model_best.pt"
+    ckpt_path = Path(ckpt_path) if ckpt_path else CKPT_DIR / "model_best.pt"
     if not ckpt_path.exists():
         raise FileNotFoundError(f"Checkpoint not found: {ckpt_path}")
 
@@ -317,14 +317,14 @@ def recompute_scores():
     # Save results to JSON so run_and_exit.sh can read the summary
     # and subsequent detect.py calls can use --load instead of --recompute.
     save_scores(test_scores, test_labels.bool(), val_mean, val_std,
-                n_sigma=2.0, ckpt_epoch=ckpt["epoch"])
+                n_sigma=2.0, ckpt_epoch=ckpt["epoch"], out_path=out_path)
 
     return test_scores, test_labels.bool(), val_mean, val_std
 
 
 def save_scores(test_scores: torch.Tensor, labels: torch.Tensor,
                 val_mean: float, val_std: float,
-                n_sigma: float = 2.0, ckpt_epoch: int = 0):
+                n_sigma: float = 2.0, ckpt_epoch: int = 0, out_path=None):
     """
     Write results/anomaly_scores.json in the same format the old
     train_transformer.py produced, so run_and_exit.sh and load_saved_scores()
@@ -367,7 +367,8 @@ def save_scores(test_scores: torch.Tensor, labels: torch.Tensor,
         "test_labels": labels.tolist(),
     }
 
-    out = RES_DIR / "anomaly_scores.json"
+    out = Path(out_path) if out_path else RES_DIR / "anomaly_scores.json"
+    out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps(results, indent=2))
     print(f"  Results saved -> {out}")
 
@@ -418,7 +419,10 @@ def main():
 
     if args.recompute:
         print("  Mode: recompute from checkpoint")
-        scores, labels, val_mean, val_std = recompute_scores()
+        scores, labels, val_mean, val_std = recompute_scores(
+            ckpt_path=args.checkpoint,
+            out_path=args.scores_file,
+        )
     elif args.scores_file:
         print(f"  Mode: load from {args.scores_file}")
         scores, labels, val_mean, val_std = load_saved_scores(Path(args.scores_file))
