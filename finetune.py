@@ -600,6 +600,8 @@ def main():
     parser.add_argument("--min-windows",  type=int,   default=10)
     parser.add_argument("--resume",       action="store_true",
                         help="Resume from existing model_finetuned.pt — skips Phase 1")
+    parser.add_argument("--eval-only",    action="store_true",
+                        help="Skip training — load existing model_finetuned.pt and evaluate")
     args = parser.parse_args()
 
     tenant_dir = Path(args.tenant_dir)
@@ -707,6 +709,9 @@ def main():
     val_loader   = DataLoader(WindowDataset(val_windows),
                               batch_size=BATCH_SIZE, shuffle=False, num_workers=0)
 
+    if args.eval_only:
+        print("\n  --eval-only: skipping training, evaluating existing checkpoint.")
+
     # ── Training ──────────────────────────────────────────────────────────────
     log_path = out_dir / "finetune_log.json"
     if args.resume and log_path.exists():
@@ -728,7 +733,9 @@ def main():
         }, best_ckpt_path)
 
     # ── Phase 1: frozen — only user embeddings update ─────────────────────────
-    if args.resume:
+    if args.eval_only:
+        pass  # skip all training
+    elif args.resume:
         print(f"\n  Skipping Phase 1 (resume — user embeddings already trained).")
         args.freeze_epochs = 0
 
@@ -776,7 +783,7 @@ def main():
 
     # ── Phase 2: unfrozen — full model updates ────────────────────────────────
     unfrozen_epochs = args.epochs - args.freeze_epochs
-    if unfrozen_epochs > 0:
+    if not args.eval_only and unfrozen_epochs > 0:
         print(f"\n{'='*60}")
         print(f"  Phase 2 -- Unfrozen (until {EARLY_STOP_PATIENCE} epochs no improvement, LR={LR_UNFROZEN:.0e})")
         print(f"  All parameters train. Conservative LR preserves base knowledge.")
@@ -829,14 +836,16 @@ def main():
     # ── Save training log ─────────────────────────────────────────────────────
     (out_dir / "finetune_log.json").write_text(json.dumps(log, indent=2))
 
-    print(f"\nFine-tuning complete.")
-    print(f"  Best val loss: {best_val_loss:.4f}  "
-          f"(ppl={math.exp(best_val_loss):.2f})")
+    if not args.eval_only:
+        print(f"\nFine-tuning complete.")
+        print(f"  Best val loss: {best_val_loss:.4f}  "
+              f"(ppl={math.exp(best_val_loss):.2f})")
 
     # ── Load best checkpoint for evaluation ───────────────────────────────────
     print(f"\nLoading best checkpoint for calibration + evaluation...")
     best = torch.load(best_ckpt_path, map_location=device, weights_only=True)
     model.load_state_dict(best["model_state"])
+    print(f"  Checkpoint: epoch={best.get('epoch')}  val_loss={best.get('val_loss'):.4f}")
 
     # ── Calibrate per-user thresholds ─────────────────────────────────────────
     print(f"\nCalibrating per-user thresholds from val set...")
