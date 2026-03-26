@@ -139,7 +139,6 @@ type_order = ["brute_force","impossible_travel","mass_download",
 type_order_f  = [t for t in type_order if t in type_total]
 xlabels       = [TYPE_DISPLAY[t] for t in type_order_f]
 model_recalls = [type_model_tp[t] / type_total[t] for t in type_order_f]
-rules_recalls = [type_rules_tp[t] / type_total[t] for t in type_order_f]
 combo_recalls = [type_combo_tp[t] / type_total[t] for t in type_order_f]
 
 
@@ -182,21 +181,19 @@ print(f"  Saved → {out1}")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# FIGURE 2 — Per-type detection breakdown (3 bars)
+# FIGURE 2 — Per-type detection breakdown (2 bars: stage 1 vs stage 1+2)
 # ══════════════════════════════════════════════════════════════════════════════
 x     = np.arange(len(xlabels))
-width = 0.25
+width = 0.35
 
 fig, ax = plt.subplots(figsize=(11, 5.5))
-bars1 = ax.bar(x - width, model_recalls, width,
-               label="Model alone  (σ=2.5)", color="#4C72B0", alpha=0.85, zorder=2)
-bars2 = ax.bar(x,          rules_recalls, width,
-               label="Stage 2 rules only",   color="#DD8800", alpha=0.85, zorder=2)
-bars3 = ax.bar(x + width,  combo_recalls, width,
-               label="Model + Stage 2 rules", color="#2ca02c", alpha=0.85, zorder=2)
+bars1 = ax.bar(x - width/2, model_recalls, width,
+               label="Stage 1 — Model alone  (σ=2.5)", color="#4C72B0", alpha=0.85, zorder=2)
+bars2 = ax.bar(x + width/2, combo_recalls, width,
+               label="Stage 1+2 — Model + bulk download rule", color="#2ca02c", alpha=0.85, zorder=2)
 
 ax.set_ylabel("Window-level Recall", fontsize=12)
-ax.set_title("LogSentinel — Detection Recall by Anomaly Type\nModel  |  Stage 2 Rules  |  Combined  (rigorous per-window evaluation)",
+ax.set_title("LogSentinel — Detection Recall by Anomaly Type\nStage 1 (transformer)  vs  Stage 1+2 (+ bulk download rule)",
              fontsize=12, fontweight="bold")
 ax.set_xticks(x)
 ax.set_xticklabels(xlabels, fontsize=10.5)
@@ -206,7 +203,7 @@ ax.legend(fontsize=10)
 ax.spines["top"].set_visible(False)
 ax.spines["right"].set_visible(False)
 
-for bars, color in [(bars1, "#4C72B0"), (bars2, "#DD8800"), (bars3, "#2ca02c")]:
+for bars, color in [(bars1, "#4C72B0"), (bars2, "#2ca02c")]:
     for bar in bars:
         h = bar.get_height()
         if h > 0:
