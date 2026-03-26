@@ -163,7 +163,7 @@ fp = int(((scores_arr >= threshold) & ~labels_arr).sum())
 fn = int(((scores_arr < threshold)  & labels_arr).sum())
 ax.annotate(f"σ=2.5 threshold\nTP={tp}  FP={fp}  FN={fn}\nFP/TP = {fp/max(tp,1):.2f}",
             xy=(threshold + 0.25, ax.get_ylim()[1] * 0.70),
-            fontsize=9.5, color="#2ca02c",
+            fontsize=11, color="#2ca02c",
             bbox=dict(boxstyle="round,pad=0.3", fc="white", ec="#2ca02c", alpha=0.85))
 
 # Annotate the missed anomalous windows below threshold
@@ -173,7 +173,7 @@ if len(fn_scores):
         f"FN={fn}: bulk download windows\n(low perplexity — blends into normal activity)",
         xy=(fn_scores.max(), 3),
         xytext=(fn_scores.mean() - 1.5, 18),
-        fontsize=8.5, color="#DD4949",
+        fontsize=10.5, color="#DD4949",
         arrowprops=dict(arrowstyle="->", color="#DD4949", lw=1.2),
         bbox=dict(boxstyle="round,pad=0.3", fc="white", ec="#DD4949", alpha=0.85),
     )
@@ -222,7 +222,7 @@ for bars, color in [(bars1, "#4C72B0"), (bars2, "#2ca02c")]:
         if h > 0:
             ax.text(bar.get_x() + bar.get_width()/2, h + 0.02,
                     f"{h:.0%}", ha="center", va="bottom",
-                    fontsize=8.5, color=color, fontweight="bold")
+                    fontsize=10, color=color, fontweight="bold")
 
 # Annotate the mass_download gap
 md_idx = type_order_f.index("mass_download")
@@ -230,7 +230,7 @@ ax.annotate(
     "Model blind spot:\nbulk exfiltration blends\ninto normal file activity.\nBurst rule fills the gap.",
     xy=(md_idx - width/2 + width/2, model_recalls[md_idx] + 0.04),
     xytext=(md_idx + 1.1, 0.55),
-    fontsize=8.5, color="#4C72B0",
+    fontsize=10.5, color="#4C72B0",
     arrowprops=dict(arrowstyle="->", color="#4C72B0", lw=1.2),
     bbox=dict(boxstyle="round,pad=0.3", fc="white", ec="#4C72B0", alpha=0.85),
 )
