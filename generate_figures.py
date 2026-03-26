@@ -122,6 +122,7 @@ rule_coverage = {
 # ── Per-type recall (rigorous) ─────────────────────────────────────────────────
 type_total    = defaultdict(int)
 type_model_tp = defaultdict(int)
+type_rules_tp = defaultdict(int)
 type_combo_tp = defaultdict(int)
 
 for score, label, uid_h, wtypes in zip(scores, labels, uid_hashes, window_types_list):
@@ -132,10 +133,13 @@ for score, label, uid_h, wtypes in zip(scores, labels, uid_hashes, window_types_
     rule_flag  = any(atype in rule_coverage and email in rule_coverage[atype] for atype in wtypes)
 
     for atype in wtypes:
-        type_total[atype]    += 1
+        type_total[atype] += 1
         if model_flag:
             type_model_tp[atype] += 1
-        if model_flag or rule_flag:
+        rule_direct = atype in rule_coverage and email in rule_coverage[atype]
+        if rule_direct:
+            type_rules_tp[atype] += 1
+        if model_flag or rule_direct:
             type_combo_tp[atype] += 1
 
 TYPE_DISPLAY = {
@@ -150,10 +154,11 @@ TYPE_DISPLAY = {
 type_order = ["brute_force","impossible_travel","mass_download",
               "mfa_disabled","new_country_login","off_hours_admin"]
 
-xlabels       = [TYPE_DISPLAY[t] for t in type_order if t in type_total]
-model_recalls = [type_model_tp[t]/type_total[t] for t in type_order if t in type_total]
-combo_recalls = [type_combo_tp[t]/type_total[t] for t in type_order if t in type_total]
 type_order_f  = [t for t in type_order if t in type_total]
+xlabels       = [TYPE_DISPLAY[t] for t in type_order_f]
+model_recalls = [type_model_tp[t] / type_total[t] for t in type_order_f]
+rules_recalls = [type_rules_tp[t] / type_total[t] for t in type_order_f]
+combo_recalls = [type_combo_tp[t] / type_total[t] for t in type_order_f]
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -195,36 +200,37 @@ print(f"  Saved → {out1}")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# FIGURE 2 — Per-type detection breakdown
+# FIGURE 2 — Per-type detection breakdown (3 bars)
 # ══════════════════════════════════════════════════════════════════════════════
 x     = np.arange(len(xlabels))
-width = 0.35
+width = 0.25
 
-fig, ax = plt.subplots(figsize=(10, 5.5))
-bars1 = ax.bar(x - width/2, model_recalls, width,
+fig, ax = plt.subplots(figsize=(11, 5.5))
+bars1 = ax.bar(x - width, model_recalls, width,
                label="Model alone  (σ=2.5)", color="#4C72B0", alpha=0.85, zorder=2)
-bars2 = ax.bar(x + width/2, combo_recalls, width,
+bars2 = ax.bar(x,          rules_recalls, width,
+               label="Stage 2 rules only",   color="#DD8800", alpha=0.85, zorder=2)
+bars3 = ax.bar(x + width,  combo_recalls, width,
                label="Model + Stage 2 rules", color="#2ca02c", alpha=0.85, zorder=2)
 
 ax.set_ylabel("Window-level Recall", fontsize=12)
-ax.set_title("LogSentinel — Detection Recall by Anomaly Type\nModel alone vs Model + Hardcoded Rules  (rigorous per-window evaluation)",
+ax.set_title("LogSentinel — Detection Recall by Anomaly Type\nModel  |  Stage 2 Rules  |  Combined  (rigorous per-window evaluation)",
              fontsize=12, fontweight="bold")
 ax.set_xticks(x)
 ax.set_xticklabels(xlabels, fontsize=10.5)
-ax.set_ylim(0, 1.18)
+ax.set_ylim(0, 1.22)
 ax.axhline(1.0, color="grey", linewidth=0.8, linestyle=":", zorder=1)
 ax.legend(fontsize=10)
 ax.spines["top"].set_visible(False)
 ax.spines["right"].set_visible(False)
 
-for bar in bars1:
-    h = bar.get_height()
-    ax.text(bar.get_x() + bar.get_width()/2, h + 0.02,
-            f"{h:.0%}", ha="center", va="bottom", fontsize=9, color="#4C72B0", fontweight="bold")
-for bar in bars2:
-    h = bar.get_height()
-    ax.text(bar.get_x() + bar.get_width()/2, h + 0.02,
-            f"{h:.0%}", ha="center", va="bottom", fontsize=9, color="#2ca02c", fontweight="bold")
+for bars, color in [(bars1, "#4C72B0"), (bars2, "#DD8800"), (bars3, "#2ca02c")]:
+    for bar in bars:
+        h = bar.get_height()
+        if h > 0:
+            ax.text(bar.get_x() + bar.get_width()/2, h + 0.02,
+                    f"{h:.0%}", ha="center", va="bottom",
+                    fontsize=8.5, color=color, fontweight="bold")
 
 fig.tight_layout()
 out2 = OUT_DIR / "detection_breakdown.png"
