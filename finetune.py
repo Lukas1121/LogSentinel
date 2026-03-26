@@ -734,7 +734,8 @@ def main():
 
     # ── Phase 1: frozen — only user embeddings update ─────────────────────────
     if args.eval_only:
-        pass  # skip all training
+        args.freeze_epochs = 0
+        args.epochs = 0
     elif args.resume:
         print(f"\n  Skipping Phase 1 (resume — user embeddings already trained).")
         args.freeze_epochs = 0
