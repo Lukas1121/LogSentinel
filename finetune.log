@@ -1,0 +1,140 @@
+nohup: ignoring input
+
+============================================================
+  LogSentinel -- Fine-tuning
+============================================================
+  Tenant dir:     data\tenant_test
+  Base ckpt:      checkpoints\model_best.pt
+  Output dir:     data\tenant_test\finetuned
+  Device:         cuda
+  Total epochs:   500
+  Frozen epochs:  5  (user embeddings only)
+  Unfrozen epochs:495  (full model)
+
+Loading tenant data...
+  Train: 192,177 events
+  Val:   36,143 events
+  Test:  30,148 events  (246 anomalous)
+
+Building tenant vocab...
+  Base vocab:  118 tokens
+  New user tokens: 30  ->  total 148
+  Tenant vocab saved -> data\tenant_test\finetuned\tokeniser_tenant.json  (148 tokens, 30 new user tokens)
+
+Resuming from data\tenant_test\finetuned\model_finetuned.pt...
+  Checkpoint: epoch=3  val_loss=0.6101
+  Model: vocab=2048 emb=192 layers=4 heads=6
+
+Packing training windows...
+  Train: 5,242 windows
+  Val:   975 windows
+
+  Loaded existing training log (15 epochs).
+
+  Skipping Phase 1 (resume — user embeddings already trained).
+
+============================================================
+  Phase 2 -- Unfrozen (until 5 epochs no improvement, LR=3e-05)
+  All parameters train. Conservative LR preserves base knowledge.
+============================================================
+
+E:\Projects\LogSentinel\finetune.py:554: FutureWarning: `torch.cuda.amp.GradScaler(args...)` is deprecated. Please use `torch.amp.GradScaler('cuda', args...)` instead.
+  scaler = torch.cuda.amp.GradScaler(enabled=False)
+E:\Projects\LogSentinel\finetune.py:558: FutureWarning: `torch.cuda.amp.autocast(args...)` is deprecated. Please use `torch.amp.autocast('cuda', args...)` instead.
+  with torch.cuda.amp.autocast(enabled=False):
+    step   20/328  loss 0.5384
+    step   40/328  loss 0.5361
+    step   60/328  loss 0.5336
+    step   80/328  loss 0.5328
+    step  100/328  loss 0.5323
+    step  120/328  loss 0.5320
+    step  140/328  loss 0.5324
+    step  160/328  loss 0.5327
+    step  180/328  loss 0.5323
+    step  200/328  loss 0.5318
+    step  220/328  loss 0.5319
+    step  240/328  loss 0.5315
+    step  260/328  loss 0.5314
+    step  280/328  loss 0.5312
+    step  300/328  loss 0.5309
+    step  320/328  loss 0.5308
+
+[Unfrozen] Epoch 1/500 -- train: 0.5309  val: 0.6230  ppl: 1.86  (70s)
+  No improvement -- patience 1/5
+    step   20/328  loss 0.5275
+    step   40/328  loss 0.5260
+    step   60/328  loss 0.5270
+    step   80/328  loss 0.5275
+    step  100/328  loss 0.5280
+    step  120/328  loss 0.5278
+    step  140/328  loss 0.5277
+    step  160/328  loss 0.5284
+    step  180/328  loss 0.5286
+    step  200/328  loss 0.5288
+    step  220/328  loss 0.5290
+    step  240/328  loss 0.5289
+    step  260/328  loss 0.5286
+    step  280/328  loss 0.5285
+    step  300/328  loss 0.5283
+    step  320/328  loss 0.5285
+
+[Unfrozen] Epoch 2/500 -- train: 0.5288  val: 0.6158  ppl: 1.85  (70s)
+  No improvement -- patience 2/5
+    step   20/328  loss 0.5281
+    step   40/328  loss 0.5252
+    step   60/328  loss 0.5261
+    step   80/328  loss 0.5266
+    step  100/328  loss 0.5274
+    step  120/328  loss 0.5276
+    step  140/328  loss 0.5279
+    step  160/328  loss 0.5281
+    step  180/328  loss 0.5277
+    step  200/328  loss 0.5271
+    step  220/328  loss 0.5269
+    step  240/328  loss 0.5267
+    step  260/328  loss 0.5269
+    step  280/328  loss 0.5271
+    step  300/328  loss 0.5273
+    step  320/328  loss 0.5277
+
+[Unfrozen] Epoch 3/500 -- train: 0.5273  val: 0.6216  ppl: 1.86  (70s)
+  No improvement -- patience 3/5
+    step   20/328  loss 0.5282
+    step   40/328  loss 0.5275
+    step   60/328  loss 0.5275
+    step   80/328  loss 0.5268
+    step  100/328  loss 0.5265
+    step  120/328  loss 0.5268
+    step  140/328  loss 0.5261
+    step  160/328  loss 0.5263
+    step  180/328  loss 0.5264
+    step  200/328  loss 0.5263
+    step  220/328  loss 0.5263
+    step  240/328  loss 0.5262
+    step  260/328  loss 0.5262
+    step  280/328  loss 0.5262
+    step  300/328  loss 0.5265
+    step  320/328  loss 0.5265
+
+[Unfrozen] Epoch 4/500 -- train: 0.5264  val: 0.6132  ppl: 1.85  (70s)
+  No improvement -- patience 4/5
+    step   20/328  loss 0.5220
+    step   40/328  loss 0.5246
+    step   60/328  loss 0.5246
+    step   80/328  loss 0.5247
+    step  100/328  loss 0.5247
+    step  120/328  loss 0.5243
+    step  140/328  loss 0.5244
+    step  160/328  loss 0.5244
+    step  180/328  loss 0.5247
+    step  200/328  loss 0.5248
+    step  220/328  loss 0.5247
+    step  240/328  loss 0.5244
+    step  260/328  loss 0.5248
+    step  280/328  loss 0.5248
+    step  300/328  loss 0.5245
+    step  320/328  loss 0.5241
+
+[Unfrozen] Epoch 5/500 -- train: 0.5243  val: 0.6080  ppl: 1.84  (70s)
+  New best saved  (val_loss=0.6080)
+    step   20/328  loss 0.5243

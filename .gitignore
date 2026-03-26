@@ -3,6 +3,8 @@ data/
 checkpoints/
 logs/
 results/
+!results/figures/
+!results/figures/*.png
 *.h5
 *.pt
 *.bin
