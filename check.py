@@ -1,5 +1,12 @@
+"""
+Combined detection analysis: Model alone vs Model + Stage 2 rules.
+All metrics computed at the window level for consistency.
+"""
 import json, hashlib
-from collections import defaultdict, Counter
+from collections import defaultdict
+from datetime import datetime, timedelta
+
+SIGMA = 2.5
 
 # ── Load model scores ──────────────────────────────────────────────────────────
 with open('data/tenant_test/finetuned/anomaly_scores.json') as f:
@@ -7,35 +14,28 @@ with open('data/tenant_test/finetuned/anomaly_scores.json') as f:
 
 scores   = results['test_scores']
 labels   = results['test_labels']
-user_ids = results['test_user_ids']
+user_ids = results['test_user_ids']   # md5[:4] hashes
 val_mean = results['val_mean']
 val_std  = results['val_std']
-
-SIGMA = 2.5
 threshold = val_mean + SIGMA * val_std
 
 # ── Load raw events ────────────────────────────────────────────────────────────
 events = [json.loads(l) for l in open('data/tenant_test/anomaly_test.jsonl')]
 
-# Map hash -> anomaly types per user
 hash_to_email = {}
-hash_to_types = defaultdict(set)
 for e in events:
     uid = e.get('UserId', '')
     h = hashlib.md5(uid.encode()).hexdigest()[:4]
     hash_to_email[h] = uid
-    if '_anomaly' in e:
-        hash_to_types[h].add(e['_anomaly']['type'])
 
-# ── Stage 2 rules ──────────────────────────────────────────────────────────────
-from datetime import datetime, timedelta
 
-DOWNLOAD_OPS = {"FileDownloaded", "FileSyncDownloadedFull", "FileSyncDownloadedPartial", "FileAccessed"}
-
+# ── Stage 2 rules → sets of detected user emails ──────────────────────────────
 def parse_time(ts):
     return datetime.fromisoformat(ts.replace("Z", "+00:00"))
 
-# Rule 1: mass_download — flag users
+DOWNLOAD_OPS = {"FileDownloaded", "FileSyncDownloadedFull", "FileSyncDownloadedPartial", "FileAccessed"}
+
+# Rule 1: mass_download
 rule_md_users = set()
 user_dl = defaultdict(list)
 for e in events:
@@ -52,7 +52,7 @@ for uid, evts in user_dl.items():
             break
         i += 1
 
-# Rule 2: brute_force — flag users targeted
+# Rule 2: brute_force
 rule_bf_users = set()
 ip_fails = defaultdict(list)
 for e in events:
@@ -70,50 +70,96 @@ for ip, evts in ip_fails.items():
             break
         i += 1
 
-# Rule 3: mfa_disabled — flag users
+# Rule 3: mfa_disabled
 rule_mfa_users = {e.get('UserId', '') for e in events if e.get('Operation') == 'Disable Strong Authentication'}
 
-rule_detected_emails = rule_md_users | rule_bf_users | rule_mfa_users
+all_rule_users = rule_md_users | rule_bf_users | rule_mfa_users
 
-# ── Model detected users ───────────────────────────────────────────────────────
-model_detected_hashes = set()
+
+# ── Window-level predictions ───────────────────────────────────────────────────
+model_pred    = []
+combined_pred = []
+
 for score, label, uid_h in zip(scores, labels, user_ids):
-    if label and score >= threshold:
-        model_detected_hashes.add(uid_h)
+    email = hash_to_email.get(uid_h, '')
+    m = score >= threshold
+    c = m or (email in all_rule_users)
+    model_pred.append(m)
+    combined_pred.append(c)
 
-model_detected_emails = {hash_to_email[h] for h in model_detected_hashes if h in hash_to_email}
+def metrics(pred, labels):
+    tp = sum(p and l  for p, l in zip(pred, labels))
+    fp = sum(p and not l for p, l in zip(pred, labels))
+    fn = sum(not p and l  for p, l in zip(pred, labels))
+    tn = sum(not p and not l for p, l in zip(pred, labels))
+    prec   = tp / max(tp + fp, 1)
+    rec    = tp / max(tp + fn, 1)
+    f1     = 2 * prec * rec / max(prec + rec, 1e-8)
+    fp_tp  = fp / max(tp, 1)
+    return tp, fp, fn, tn, prec, rec, f1, fp_tp
 
-# ── Ground truth ──────────────────────────────────────────────────────────────
-all_anomaly_users = defaultdict(set)  # type -> set of emails
+
+# ── What's still missed after combined? ───────────────────────────────────────
+missed_hashes = set()
+for pred, label, uid_h in zip(combined_pred, labels, user_ids):
+    if label and not pred:
+        missed_hashes.add(uid_h)
+
+missed_types = defaultdict(set)
 for e in events:
     if '_anomaly' in e:
-        all_anomaly_users[e['_anomaly']['type']].add(e.get('UserId', ''))
+        uid = e.get('UserId', '')
+        h = hashlib.md5(uid.encode()).hexdigest()[:4]
+        if h in missed_hashes:
+            missed_types[e['_anomaly']['type']].add(uid)
 
-# ── Combined analysis ─────────────────────────────────────────────────────────
-combined_detected = model_detected_emails | rule_detected_emails
 
-print("=" * 60)
-print("  Combined Detection: Model (sigma=2.5) + Stage 2 Rules")
-print("=" * 60)
-print(f"\n  {'Anomaly type':<25} {'Total':>5}  {'Model':>6}  {'Rules':>6}  {'Combined':>9}  {'Still missed'}")
-print("  " + "-" * 70)
+# ── Print report ───────────────────────────────────────────────────────────────
+total = len(labels)
+n_anom = sum(labels)
 
-total_users = 0
-total_detected = 0
+print("=" * 66)
+print("  LogSentinel — Full Architecture Evaluation")
+print("=" * 66)
+print(f"  Test set: {total} windows  ({n_anom} anomalous,  {total - n_anom} normal)")
+print(f"  Sigma:    {SIGMA}  |  Threshold: {threshold:.2f}  (mean={val_mean:.2f}, std={val_std:.2f})")
 
-for atype, users in sorted(all_anomaly_users.items()):
-    n = len(users)
-    m = len(users & model_detected_emails)
-    r = len(users & rule_detected_emails)
-    c = len(users & combined_detected)
-    missed = users - combined_detected
-    total_users += n
-    total_detected += c
-    missed_str = ', '.join(sorted(missed)) if missed else 'none'
-    print(f"  {atype:<25} {n:>5}  {m:>6}  {r:>6}  {c:>9}  {missed_str}")
+# Section 1: Model alone
+tp, fp, fn, tn, prec, rec, f1, fp_tp = metrics(model_pred, labels)
+print(f"\n{'─' * 66}")
+print(f"  STAGE 1 — Transformer model only")
+print(f"{'─' * 66}")
+print(f"  TP={tp}   FP={fp}   FN={fn}   TN={tn}")
+print(f"  Precision: {prec:.3f}   Recall: {rec:.3f}   F1: {f1:.3f}")
+print(f"  FP/TP ratio: {fp_tp:.2f}  (false alerts per true alert)")
 
-print("  " + "-" * 70)
-print(f"  {'TOTAL':<25} {total_users:>5}  {'':>6}  {'':>6}  {total_detected:>9}  {total_users - total_detected} missed")
-recall = total_detected / total_users if total_users else 0
-print(f"\n  Overall user-level recall: {recall:.3f}  ({total_detected}/{total_users} anomalous users detected)")
-print("=" * 60)
+# Section 2: Rules alone
+rule_pred = [hash_to_email.get(uid_h, '') in all_rule_users for uid_h in user_ids]
+tp_r, fp_r, fn_r, tn_r, prec_r, rec_r, f1_r, fp_tp_r = metrics(rule_pred, labels)
+print(f"\n{'─' * 66}")
+print(f"  STAGE 2 — Rules only  (mass_download + brute_force + mfa_disabled)")
+print(f"{'─' * 66}")
+print(f"  TP={tp_r}   FP={fp_r}   FN={fn_r}   TN={tn_r}")
+print(f"  Precision: {prec_r:.3f}   Recall: {rec_r:.3f}   F1: {f1_r:.3f}")
+print(f"  FP/TP ratio: {fp_tp_r:.2f}")
+
+# Section 3: Combined
+tp_c, fp_c, fn_c, tn_c, prec_c, rec_c, f1_c, fp_tp_c = metrics(combined_pred, labels)
+print(f"\n{'─' * 66}")
+print(f"  COMBINED — Model + Rules")
+print(f"{'─' * 66}")
+print(f"  TP={tp_c}   FP={fp_c}   FN={fn_c}   TN={tn_c}")
+print(f"  Precision: {prec_c:.3f}   Recall: {rec_c:.3f}   F1: {f1_c:.3f}")
+print(f"  FP/TP ratio: {fp_tp_c:.2f}  (false alerts per true alert)")
+
+# Section 4: What's still missed
+print(f"\n{'─' * 66}")
+print(f"  Still missed after combined ({fn_c} windows)")
+print(f"{'─' * 66}")
+if not missed_types:
+    print("  None — all anomalous users detected.")
+else:
+    for atype, users in sorted(missed_types.items()):
+        print(f"  {atype:<25}  {len(users)} user(s): {', '.join(sorted(users))}")
+
+print("=" * 66)
